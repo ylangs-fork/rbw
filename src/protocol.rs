@@ -17,6 +17,18 @@ pub const VERSION: u32 = {
         + unwrap(&u32::from_str_radix(patch, 10)) * 1_000_000
 };
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct AuthRequestInfo {
+    pub id: String,
+    pub fingerprint: String,
+    pub device_type: String,
+    pub ip_address: String,
+    pub country_name: Option<String>,
+    pub creation_date: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Request {
     tty: Option<String>,
@@ -171,6 +183,14 @@ pub enum Action {
     Login,
     Register,
     Unlock,
+    UnlockWithDevice,
+    ListAuthRequests,
+    ApproveAuthRequest {
+        id: String,
+    },
+    RejectAuthRequest {
+        id: String,
+    },
     CheckLock,
     Lock,
     Sync,
@@ -194,8 +214,71 @@ pub enum Action {
 #[serde(tag = "type")]
 pub enum Response {
     Ack,
+    DeviceAuthPending { id: String, fingerprint: String },
+    AuthRequests { requests: Vec<AuthRequestInfo> },
+    AuthRequestApproval { request: AuthRequestInfo },
     Error { error: String },
     Decrypt { plaintext: String },
     Encrypt { cipherstring: String },
     Version { version: u32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> AuthRequestInfo {
+        AuthRequestInfo {
+            id: "request-id".to_string(),
+            fingerprint: "one-two-three-four-five".to_string(),
+            device_type: "Linux Desktop".to_string(),
+            ip_address: "192.0.2.1".to_string(),
+            country_name: Some("Test".to_string()),
+            creation_date: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_request_ipc_contains_only_safe_metadata() {
+        let response = Response::AuthRequests {
+            requests: vec![info()],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("one-two-three-four-five"));
+        assert!(!json.contains("accessCode"));
+        assert!(!json.contains("privateKey"));
+        assert!(!json.contains("userKey"));
+        assert!(!json.contains("pam"));
+        assert!(!json.contains("localAuth"));
+        assert!(!json.contains("authenticated"));
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Response::AuthRequests { requests } => {
+                assert_eq!(requests, vec![info()]);
+            }
+            _ => panic!("wrong response variant"),
+        }
+    }
+
+    #[test]
+    fn approval_action_cannot_claim_local_authentication() {
+        assert_eq!(
+            serde_json::to_value(Action::ApproveAuthRequest {
+                id: "00000000-0000-0000-0000-000000000000".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "ApproveAuthRequest",
+                "id": "00000000-0000-0000-0000-000000000000",
+            }),
+        );
+    }
+
+    #[test]
+    fn device_unlock_action_has_no_key_material() {
+        assert_eq!(
+            serde_json::to_value(Action::UnlockWithDevice).unwrap(),
+            serde_json::json!({"type": "UnlockWithDevice"}),
+        );
+    }
 }

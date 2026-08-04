@@ -4,6 +4,7 @@ pub struct State {
     pub priv_key: Option<rbw::locked::Keys>,
     pub org_keys:
         Option<std::collections::HashMap<String, rbw::locked::Keys>>,
+    pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
     pub timeout: crate::timeout::Timeout,
     pub timeout_duration: std::time::Duration,
     pub sync_timeout: crate::timeout::Timeout,
@@ -43,10 +44,18 @@ impl State {
         self.timeout.set(self.timeout_duration);
     }
 
+    pub fn cancellation(&self) -> Cancellation {
+        Cancellation {
+            receiver: self.clear_generation.subscribe(),
+        }
+    }
+
     pub fn clear(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
         self.timeout.clear();
+        let next = self.clear_generation.borrow().wrapping_add(1);
+        self.clear_generation.send_replace(next);
     }
 
     pub fn set_sync_timeout(&self) {
@@ -142,5 +151,60 @@ impl State {
         environment: rbw::protocol::Environment,
     ) {
         self.last_environment = environment;
+    }
+}
+
+pub struct Cancellation {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+
+impl Cancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.receiver.has_changed().unwrap_or(true)
+    }
+
+    pub async fn cancelled(&mut self) {
+        let _ = self.receiver.changed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> rbw::locked::Keys {
+        let mut material = rbw::locked::Vec::new();
+        material.extend(0_u8..64);
+        rbw::locked::Keys::new(material)
+    }
+
+    #[tokio::test]
+    async fn clear_removes_user_and_organization_keys() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: Some(keys()),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            timeout_duration: std::time::Duration::from_secs(60),
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        let mut cancellation = state.cancellation();
+        assert!(!state.needs_unlock());
+        state.clear();
+        assert!(state.needs_unlock());
+        assert!(state.priv_key.is_none());
+        assert!(state.org_keys.is_none());
+        assert!(cancellation.is_cancelled());
+        cancellation.cancelled().await;
     }
 }

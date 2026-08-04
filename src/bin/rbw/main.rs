@@ -43,13 +43,25 @@ enum Opt {
     Login,
 
     #[command(about = "Unlock the local Bitwarden database")]
-    Unlock,
+    Unlock {
+        #[arg(long, help = "Request approval from another device")]
+        device: bool,
+    },
 
     #[command(about = "Check if the local Bitwarden database is unlocked")]
     Unlocked,
 
     #[command(about = "Update the local copy of the Bitwarden database")]
     Sync,
+
+    #[command(
+        name = "auth-request",
+        about = "List, approve, or reject device login requests"
+    )]
+    AuthRequest {
+        #[command(subcommand)]
+        command: AuthRequestCommand,
+    },
 
     #[command(
         about = "List all entries in the local Bitwarden database",
@@ -247,9 +259,12 @@ impl Opt {
             }
             Self::Register => "register".to_string(),
             Self::Login => "login".to_string(),
-            Self::Unlock => "unlock".to_string(),
+            Self::Unlock { .. } => "unlock".to_string(),
             Self::Unlocked => "unlocked".to_string(),
             Self::Sync => "sync".to_string(),
+            Self::AuthRequest { command } => {
+                format!("auth-request {}", command.subcommand_name())
+            }
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
@@ -263,6 +278,41 @@ impl Opt {
             Self::Purge => "purge".to_string(),
             Self::StopAgent => "stop-agent".to_string(),
             Self::GenCompletions { .. } => "gen-completions".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum AuthRequestCommand {
+    #[command(about = "List pending device login requests")]
+    List {
+        #[arg(long, help = "Display output as JSON")]
+        raw: bool,
+    },
+    #[command(
+        about = "Approve a device login request after local system authentication"
+    )]
+    Approve {
+        #[arg(
+            help = "Request ID or list number (omit when only one request is pending)"
+        )]
+        id: Option<String>,
+    },
+    #[command(about = "Reject a device login request")]
+    Reject {
+        #[arg(
+            help = "Request ID or list number (omit when only one request is pending)"
+        )]
+        id: Option<String>,
+    },
+}
+
+impl AuthRequestCommand {
+    fn subcommand_name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "list",
+            Self::Approve { .. } => "approve",
+            Self::Reject { .. } => "reject",
         }
     }
 }
@@ -334,9 +384,26 @@ fn main() {
         },
         Opt::Register => commands::register(),
         Opt::Login => commands::login(),
-        Opt::Unlock => commands::unlock(),
+        Opt::Unlock { device } => {
+            if device {
+                commands::unlock_with_device()
+            } else {
+                commands::unlock()
+            }
+        }
         Opt::Unlocked => commands::unlocked(),
         Opt::Sync => commands::sync(),
+        Opt::AuthRequest { command } => match command {
+            AuthRequestCommand::List { raw } => {
+                commands::auth_request_list(raw)
+            }
+            AuthRequestCommand::Approve { id } => {
+                commands::auth_request_approve(id.as_deref())
+            }
+            AuthRequestCommand::Reject { id } => {
+                commands::auth_request_reject(id.as_deref())
+            }
+        },
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
             find_args,
@@ -521,5 +588,37 @@ fn main() {
     if let Err(e) = res {
         eprintln!("{e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_request_commands_accept_optional_selectors() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        for selector in [uuid, "1", "2", "not-a-uuid", "1abc"] {
+            assert!(Opt::try_parse_from([
+                "rbw",
+                "auth-request",
+                "approve",
+                selector
+            ])
+            .is_ok());
+            assert!(Opt::try_parse_from([
+                "rbw",
+                "auth-request",
+                "reject",
+                selector
+            ])
+            .is_ok());
+        }
+        assert!(
+            Opt::try_parse_from(["rbw", "auth-request", "approve"]).is_ok()
+        );
+        assert!(
+            Opt::try_parse_from(["rbw", "auth-request", "reject"]).is_ok()
+        );
     }
 }

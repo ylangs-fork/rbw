@@ -4,6 +4,7 @@ mod actions;
 mod agent;
 mod daemon;
 mod debugger;
+mod local_auth;
 mod notifications;
 mod sock;
 mod ssh_agent;
@@ -34,6 +35,7 @@ async fn tokio_main(
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::state::State {
             priv_key: None,
             org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
             timeout_duration,
             sync_timeout,
@@ -99,6 +101,10 @@ fn real_main() -> anyhow::Result<()> {
 }
 
 fn main() {
+    if crate::local_auth::helper_requested() {
+        std::process::exit(i32::from(!crate::local_auth::run_helper()));
+    }
+
     let res = real_main();
 
     if let Err(e) = res {

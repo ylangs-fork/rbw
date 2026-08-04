@@ -67,7 +67,10 @@ it out via `nix-shell -p rbw`.
 With a working Rust installation, `rbw` can be installed via `cargo install
 --locked rbw`. This requires that the
 [`pinentry`](https://www.gnupg.org/related_software/pinentry/index.en.html)
-program is installed (to display password prompts).
+program is installed (to display password prompts). On GNU/Linux, PAM-backed
+local approval also requires PAM development files when building from source
+(`libpam0g-dev` on Debian/Ubuntu, or the distribution equivalent) and the
+chosen PAM modules at runtime.
 
 ## Configuration
 
@@ -137,6 +140,77 @@ order to use `rbw` with the official Bitwarden server, you will need to first
 run `rbw register` to register each device using `rbw` with the Bitwarden
 server. This will prompt you for your personal API key which you can find using
 the instructions [here](https://bitwarden.com/help/article/personal-api-key/).
+
+### Login with device
+
+A device which has previously logged in and is registered with the server can
+request approval instead of entering the Master Password:
+
+```sh
+rbw unlock --device
+```
+
+The command displays a five-word fingerprint and waits up to five minutes for
+another unlocked device to answer. Approval on GNU/Linux is gated by the fixed
+PAM service `rbw-device-auth`. An administrator must install a dedicated policy at
+`/etc/pam.d/rbw-device-auth`; `rbw-agent` fails closed if that path is missing,
+is not a regular root-owned file, or is writable by group or other users. It
+does not fall back to `/etc/pam.d/other` or allow the service name to be changed
+through rbw configuration or the environment.
+
+For example, a fingerprint-only policy using `pam_fprintd` can contain:
+
+```pam
+#%PAM-1.0
+auth required pam_fprintd.so
+account required pam_permit.so
+```
+
+A password policy can use `pam_unix.so`, while a face-recognition system such as
+Howdy can install its own PAM module instead. Exact module names and control
+flags are distribution-specific and remain a system-administrator decision.
+Keep the policy root-owned and not writable by group or other users (typically
+mode `0644`). PAM secret prompts are displayed through rbw's configured
+pinentry together with the validated request UUID and locally derived five-word
+fingerprint; PAM-provided prompt and error text is not reflected into rbw output
+or logs.
+
+PAM is linked only in GNU/Linux builds. The portable musl release remains able
+to request a device unlock, but fails closed if asked to approve locally; use a
+GNU/Linux source build or Debian package for the approver. macOS and Android
+builds likewise keep requester support without PAM approval.
+
+Then compare the fingerprint shown on both devices before approving:
+
+```sh
+rbw auth-request list
+rbw auth-request approve <request-id-or-number>
+# or: rbw auth-request reject <request-id-or-number>
+```
+
+The list output shows a leading number for each pending request. You can
+approve or reject by that number instead of copying the full request ID. When
+only one request is pending, the ID or number can be omitted entirely.
+
+Each approval requires a new successful PAM authentication. The approver agent
+must already be unlocked: PAM provides only a local authorization decision for
+releasing the in-memory User Key and never supplies, derives, stores, or recovers
+that key. A remote requester cannot select the PAM service or claim a successful
+local authentication; neither value exists in the public IPC or server protocol.
+Device approval does not bypass Master Password Reprompt on individual vault
+entries.
+
+PAM returns an authorization decision, not an attestation of which module or
+hardware produced it. The root-owned local policy is the trust authority. If
+local user presence is required, administrators must not configure remote or
+non-user-presence modules in `rbw-device-auth`; rbw intentionally does not impose
+a module allowlist.
+
+Locking or clearing the agent cancels active device-auth waits, terminates an
+in-progress local-auth helper, and prevents a late local key install. It cannot
+recall an approval the server accepted just before cancellation. Closing the
+requester CLI after it prints the metadata does not proactively cancel the agent
+task; explicitly lock the agent or let the five-minute request deadline expire.
 
 ### SSH Agent
 

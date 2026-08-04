@@ -71,15 +71,22 @@ impl Agent {
                     );
                     let state = self.state.clone();
                     tokio::spawn(async move {
-                        let res =
-                            handle_request(&mut sock, state.clone()).await;
+                        let res = Box::pin(handle_request(
+                            &mut sock,
+                            state.clone(),
+                        ))
+                        .await;
                         if let Err(e) = res {
-                            // unwrap is the only option here
-                            sock.send(&rbw::protocol::Response::Error {
-                                error: format!("{e:#}"),
-                            })
-                            .await
-                            .unwrap();
+                            if let Err(error) = sock
+                                .send(&rbw::protocol::Response::Error {
+                                    error: format!("{e:#}"),
+                                })
+                                .await
+                            {
+                                log::debug!(
+                                    "client disconnected before agent error response: {error:#}"
+                                );
+                            }
                         }
                     });
                 }
@@ -130,6 +137,33 @@ async fn handle_request(
         rbw::protocol::Action::Unlock => {
             crate::actions::unlock(sock, state.clone(), &environment).await?;
             true
+        }
+        rbw::protocol::Action::UnlockWithDevice => {
+            Box::pin(crate::actions::unlock_with_device(
+                sock,
+                state.clone(),
+                &environment,
+            ))
+            .await?;
+            true
+        }
+        rbw::protocol::Action::ListAuthRequests => {
+            crate::actions::list_auth_requests(sock).await?;
+            false
+        }
+        rbw::protocol::Action::ApproveAuthRequest { id } => {
+            crate::actions::approve_auth_request(
+                sock,
+                state.clone(),
+                id,
+                &environment,
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::RejectAuthRequest { id } => {
+            crate::actions::reject_auth_request(sock, id).await?;
+            false
         }
         rbw::protocol::Action::CheckLock => {
             crate::actions::check_lock(sock, state.clone()).await?;

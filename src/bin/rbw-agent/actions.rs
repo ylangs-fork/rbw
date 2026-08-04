@@ -135,7 +135,6 @@ pub async fn login(
                         parallelism,
                         protected_key,
                         password,
-                        db,
                         email,
                     )
                     .await?;
@@ -191,7 +190,6 @@ pub async fn login(
                                 parallelism,
                                 protected_key,
                                 password,
-                                db,
                                 email,
                             )
                             .await?;
@@ -326,20 +324,21 @@ async fn login_success(
     parallelism: Option<u32>,
     protected_key: String,
     password: rbw::locked::Password,
-    mut db: rbw::db::Db,
     email: String,
 ) -> anyhow::Result<()> {
-    db.access_token = Some(access_token.clone());
-    db.refresh_token = Some(refresh_token.clone());
-    db.kdf = Some(kdf);
-    db.iterations = Some(iterations);
-    db.memory = memory;
-    db.parallelism = parallelism;
-    db.protected_key = Some(protected_key.clone());
-    save_db(&db).await?;
+    update_db(true, |db| {
+        db.access_token = Some(access_token);
+        db.refresh_token = Some(refresh_token);
+        db.kdf = Some(kdf);
+        db.iterations = Some(iterations);
+        db.memory = memory;
+        db.parallelism = parallelism;
+        db.protected_key = Some(protected_key.clone());
+    })
+    .await?;
 
     sync(None, state.clone()).await?;
-    let db = load_db().await?;
+    let db = load_db_coordinated().await?;
 
     let Some(protected_private_key) = db.protected_private_key else {
         return Err(anyhow::anyhow!(
@@ -369,6 +368,565 @@ async fn login_success(
     }
 
     Ok(())
+}
+
+fn auth_request_info(
+    request: &rbw::api::AuthRequest,
+    email: &str,
+) -> anyhow::Result<rbw::protocol::AuthRequestInfo> {
+    validate_auth_request_id(&request.id)?;
+    let public_key = rbw::base64::decode(&request.public_key)
+        .context("auth request contained an invalid public key")?;
+    let fingerprint = rbw::device_auth::fingerprint(email, &public_key)
+        .context("failed to calculate auth-request fingerprint")?;
+    Ok(rbw::protocol::AuthRequestInfo {
+        id: request.id.clone(),
+        fingerprint,
+        device_type: request.request_device_type.clone(),
+        ip_address: request.request_ip_address.clone(),
+        country_name: request.request_country_name.clone(),
+        creation_date: request.creation_date.clone(),
+    })
+}
+
+async fn cancel_or<T, F>(
+    cancellation: &mut crate::state::Cancellation,
+    future: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            Err(anyhow::anyhow!("device authentication cancelled because the agent was cleared"))
+        }
+        output = future => Ok(output),
+    }
+}
+
+fn ensure_not_cancelled(
+    cancellation: &crate::state::Cancellation,
+) -> anyhow::Result<()> {
+    if cancellation.is_cancelled() {
+        Err(anyhow::anyhow!(
+            "device authentication cancelled because the agent was cleared"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn auth_request_tokens() -> anyhow::Result<(String, String)> {
+    let db = load_db_coordinated().await?;
+    let access_token = db.access_token.ok_or_else(|| {
+        anyhow::anyhow!("failed to find access token in db")
+    })?;
+    let refresh_token = db.refresh_token.ok_or_else(|| {
+        anyhow::anyhow!("failed to find refresh token in db")
+    })?;
+    Ok((access_token, refresh_token))
+}
+
+fn auth_request_db_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+type DbFuture<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>,
+>;
+
+async fn coordinated_db_update_with<L, S, F>(
+    load: L,
+    save: S,
+    update: F,
+) -> anyhow::Result<()>
+where
+    L: FnOnce() -> DbFuture<'static, rbw::db::Db>,
+    S: for<'a> FnOnce(&'a rbw::db::Db) -> DbFuture<'a, ()>,
+    F: FnOnce(&mut rbw::db::Db),
+{
+    let _guard = auth_request_db_lock().lock().await;
+    let mut db = load().await?;
+    update(&mut db);
+    save(&db).await
+}
+
+async fn update_db<F>(allow_new: bool, update: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut rbw::db::Db),
+{
+    coordinated_db_update_with(
+        move || {
+            Box::pin(async move {
+                match load_db().await {
+                    Ok(db) => Ok(db),
+                    Err(_) if allow_new => Ok(rbw::db::Db::new()),
+                    Err(error) => Err(error),
+                }
+            })
+        },
+        |db| Box::pin(save_db(db)),
+        update,
+    )
+    .await
+}
+
+async fn load_db_coordinated() -> anyhow::Result<rbw::db::Db> {
+    let _guard = auth_request_db_lock().lock().await;
+    load_db().await
+}
+
+async fn save_refreshed_access_token(
+    access_token: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(access_token) = access_token {
+        update_db(false, |db| db.access_token = Some(access_token)).await?;
+    }
+    Ok(())
+}
+
+type AuthRequestLogin = (
+    String,
+    String,
+    rbw::api::KdfType,
+    u32,
+    Option<u32>,
+    Option<u32>,
+    String,
+);
+
+fn auth_request_two_factor_provider(
+    providers: &[rbw::api::TwoFactorProviderType],
+) -> anyhow::Result<rbw::api::TwoFactorProviderType> {
+    [
+        rbw::api::TwoFactorProviderType::Authenticator,
+        rbw::api::TwoFactorProviderType::Yubikey,
+        rbw::api::TwoFactorProviderType::Email,
+    ]
+    .into_iter()
+    .find(|provider| providers.contains(provider))
+    .ok_or_else(|| {
+        anyhow::anyhow!("unsupported two factor methods: {providers:?}")
+    })
+}
+
+async fn exchange_auth_request_tokens(
+    environment: &rbw::protocol::Environment,
+    email: &str,
+    access_code: &str,
+    request_id: &str,
+    deadline: tokio::time::Instant,
+    cancellation: &mut crate::state::Cancellation,
+) -> anyhow::Result<AuthRequestLogin> {
+    let first = cancel_or(
+        cancellation,
+        tokio::time::timeout_at(
+            deadline,
+            rbw::actions::login_with_auth_request(
+                email,
+                access_code,
+                request_id,
+                None,
+                None,
+            ),
+        ),
+    )
+    .await?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "auth request expired before token exchange completed"
+        )
+    })?;
+    let (providers, email_session_token) = match first {
+        Ok(login) => return Ok(login),
+        Err(rbw::error::Error::TwoFactorRequired {
+            providers,
+            sso_email_2fa_session_token,
+        }) => (providers, sso_email_2fa_session_token),
+        Err(error) => {
+            return Err(error).context(
+                "failed to exchange approved auth request for tokens",
+            )
+        }
+    };
+
+    let provider = auth_request_two_factor_provider(&providers)?;
+    if provider == rbw::api::TwoFactorProviderType::Email {
+        if let Some(email_session_token) = email_session_token {
+            cancel_or(
+                cancellation,
+                tokio::time::timeout_at(
+                    deadline,
+                    rbw::actions::send_two_factor_email(
+                        email,
+                        &email_session_token,
+                    ),
+                ),
+            )
+            .await?
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "auth request expired during two factor setup"
+                )
+            })??;
+        }
+    }
+
+    let mut err_msg = None;
+    for attempt in 1_u8..=3 {
+        let err = err_msg
+            .as_ref()
+            .map(|message| format!("{message} (attempt {attempt}/3)"));
+        let pinentry = cancel_or(
+            cancellation,
+            tokio::time::timeout_at(deadline, config_pinentry()),
+        )
+        .await?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "auth request expired while loading pinentry configuration"
+            )
+        })??;
+        let code = cancel_or(
+            cancellation,
+            tokio::time::timeout_at(
+                deadline,
+                rbw::pinentry::getpin(
+                    &pinentry,
+                    provider.header(),
+                    provider.message(),
+                    err.as_deref(),
+                    environment,
+                    provider.grab(),
+                ),
+            ),
+        )
+        .await?
+        .map_err(|_| {
+            anyhow::anyhow!("auth request expired during two factor prompt")
+        })??;
+        let code = std::str::from_utf8(code.password())
+            .context("two factor code was not valid utf8")?;
+        let login = cancel_or(
+            cancellation,
+            tokio::time::timeout_at(
+                deadline,
+                rbw::actions::login_with_auth_request(
+                    email,
+                    access_code,
+                    request_id,
+                    Some(code),
+                    Some(provider),
+                ),
+            ),
+        )
+        .await?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "auth request expired before token exchange completed"
+            )
+        })?;
+        match login {
+            Ok(login) => return Ok(login),
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if attempt == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed auth-request two factor verification");
+                }
+                err_msg = Some(message);
+            }
+            Err(rbw::error::Error::TwoFactorRequired { .. }) => {
+                let message = "TOTP code is not a number".to_string();
+                if attempt == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed auth-request two factor verification");
+                }
+                err_msg = Some(message);
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("failed auth-request two factor verification")
+            }
+        }
+    }
+    unreachable!()
+}
+
+pub async fn unlock_with_device(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let mut cancellation = {
+        let state = state.lock().await;
+        if !state.needs_unlock() {
+            return respond_ack(sock).await;
+        }
+        state.cancellation()
+    };
+
+    let email = config_email().await?;
+    let deadline =
+        tokio::time::Instant::now() + rbw::device_auth::REQUEST_DEADLINE;
+    let request_keys = rbw::device_auth::RequestKeyPair::generate()
+        .context("failed to generate auth-request key pair")?;
+    let request = cancel_or(
+        &mut cancellation,
+        tokio::time::timeout_at(
+            deadline,
+            rbw::actions::create_auth_request(
+                &email,
+                &request_keys.public_key_base64(),
+                request_keys.access_code(),
+            ),
+        ),
+    )
+    .await?
+    .map_err(|_| anyhow::anyhow!("auth request creation timed out"))??;
+    validate_auth_request_id(&request.id)?;
+    let fingerprint =
+        rbw::device_auth::fingerprint(&email, request_keys.public_key())
+            .context("failed to calculate auth-request fingerprint")?;
+    sock.send(&rbw::protocol::Response::DeviceAuthPending {
+        id: request.id.clone(),
+        fingerprint,
+    })
+    .await?;
+
+    let encrypted_user_key = loop {
+        let next_poll = std::cmp::min(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            deadline,
+        );
+        cancel_or(&mut cancellation, tokio::time::sleep_until(next_poll))
+            .await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "auth request timed out after five minutes"
+            ));
+        }
+        let response = cancel_or(
+            &mut cancellation,
+            tokio::time::timeout_at(
+                deadline,
+                rbw::actions::get_auth_request_response(
+                    &request.id,
+                    request_keys.access_code(),
+                ),
+            ),
+        )
+        .await?
+        .map_err(|_| {
+            anyhow::anyhow!("auth request timed out after five minutes")
+        })?
+        .context("failed to poll auth-request response")?;
+        match rbw::device_auth::response_state(&response)
+            .context("invalid auth-request response")?
+        {
+            rbw::device_auth::ResponseState::Pending => {}
+            rbw::device_auth::ResponseState::Approved(encrypted_user_key) => {
+                break encrypted_user_key.to_string();
+            }
+        }
+    };
+
+    let (
+        access_token,
+        refresh_token,
+        kdf,
+        iterations,
+        memory,
+        parallelism,
+        protected_key,
+    ) = exchange_auth_request_tokens(
+        environment,
+        &email,
+        request_keys.access_code(),
+        &request.id,
+        deadline,
+        &mut cancellation,
+    )
+    .await?;
+
+    ensure_not_cancelled(&cancellation)?;
+    update_db(true, |db| {
+        db.access_token = Some(access_token);
+        db.refresh_token = Some(refresh_token);
+        db.kdf = Some(kdf);
+        db.iterations = Some(iterations);
+        db.memory = memory;
+        db.parallelism = parallelism;
+        db.protected_key = Some(protected_key);
+    })
+    .await?;
+    ensure_not_cancelled(&cancellation)?;
+
+    sync(None, state.clone()).await?;
+    ensure_not_cancelled(&cancellation)?;
+    let db = cancel_or(&mut cancellation, load_db_coordinated()).await??;
+    let protected_private_key =
+        db.protected_private_key.ok_or_else(|| {
+            anyhow::anyhow!("failed to find protected private key in db")
+        })?;
+    let user_key = request_keys
+        .decrypt_user_key(&encrypted_user_key)
+        .context("failed to decrypt approved auth-request key")?;
+    let (key, org_keys) = rbw::actions::unlock_with_user_key(
+        user_key,
+        &protected_private_key,
+        &db.protected_org_keys,
+    )
+    .context("failed to unlock database with approved user key")?;
+    {
+        let mut state = state.lock().await;
+        ensure_not_cancelled(&cancellation)?;
+        state.priv_key = Some(key);
+        state.org_keys = Some(org_keys);
+    }
+    respond_ack(sock).await
+}
+
+pub async fn list_auth_requests(
+    sock: &mut crate::sock::Sock,
+) -> anyhow::Result<()> {
+    let email = config_email().await?;
+    let (access_token, refresh_token) = auth_request_tokens().await?;
+    let (new_access_token, requests) =
+        rbw::actions::pending_auth_requests(&access_token, &refresh_token)
+            .await
+            .context("failed to list pending auth requests")?;
+    save_refreshed_access_token(new_access_token).await?;
+    let requests = requests
+        .iter()
+        .map(|request| auth_request_info(request, &email))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    sock.send(&rbw::protocol::Response::AuthRequests { requests })
+        .await?;
+    Ok(())
+}
+
+fn validate_auth_request_id(request_id: &str) -> anyhow::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(request_id)
+        .context("auth-request ID is not a valid UUID")
+}
+
+fn encrypt_approval_user_key(
+    state: &crate::state::State,
+    cancellation: &crate::state::Cancellation,
+    public_key: &str,
+) -> anyhow::Result<String> {
+    ensure_not_cancelled(cancellation)?;
+    let user_key = state.key(None).ok_or_else(|| {
+        anyhow::anyhow!("agent locked during local system authentication")
+    })?;
+    rbw::device_auth::encrypt_user_key(public_key, user_key)
+        .context("failed to encrypt user key for auth request")
+}
+
+pub async fn approve_auth_request(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    request_id: &str,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let validated_request_id = validate_auth_request_id(request_id)?;
+    let mut cancellation = {
+        let state = state.lock().await;
+        if state.needs_unlock() {
+            return Err(anyhow::anyhow!(
+                "agent must be unlocked before approving an auth request"
+            ));
+        }
+        state.cancellation()
+    };
+    let email = config_email().await?;
+    let (access_token, refresh_token) = auth_request_tokens().await?;
+    let (new_access_token, request) = cancel_or(
+        &mut cancellation,
+        rbw::actions::get_auth_request(
+            &access_token,
+            &refresh_token,
+            request_id,
+        ),
+    )
+    .await??;
+    if !matches!(
+        rbw::device_auth::response_state(&request),
+        Ok(rbw::device_auth::ResponseState::Pending)
+    ) {
+        return Err(anyhow::anyhow!(
+            "auth request has already been answered or has invalid state"
+        ));
+    }
+    let active_access_token = new_access_token
+        .as_deref()
+        .unwrap_or(access_token.as_str())
+        .to_string();
+    save_refreshed_access_token(new_access_token).await?;
+    ensure_not_cancelled(&cancellation)?;
+    let request_info = auth_request_info(&request, &email)?;
+    let fingerprint = request_info.fingerprint.clone();
+    sock.send(&rbw::protocol::Response::AuthRequestApproval {
+        request: request_info,
+    })
+    .await?;
+
+    cancel_or(
+        &mut cancellation,
+        crate::local_auth::authorize(
+            environment,
+            &validated_request_id.to_string(),
+            &fingerprint,
+        ),
+    )
+    .await??;
+    let encrypted_user_key = {
+        let state = state.lock().await;
+        encrypt_approval_user_key(&state, &cancellation, &request.public_key)?
+    };
+
+    let (new_access_token, _) = cancel_or(
+        &mut cancellation,
+        rbw::actions::update_auth_request(
+            &active_access_token,
+            &refresh_token,
+            request_id,
+            &encrypted_user_key,
+            true,
+        ),
+    )
+    .await?
+    .context("failed to approve auth request")?;
+    ensure_not_cancelled(&cancellation)?;
+    save_refreshed_access_token(new_access_token).await?;
+    ensure_not_cancelled(&cancellation)?;
+    respond_ack(sock).await
+}
+
+pub async fn reject_auth_request(
+    sock: &mut crate::sock::Sock,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    validate_auth_request_id(request_id)?;
+    let (access_token, refresh_token) = auth_request_tokens().await?;
+    let (new_access_token, _) = rbw::actions::update_auth_request(
+        &access_token,
+        &refresh_token,
+        request_id,
+        "",
+        false,
+    )
+    .await
+    .context("failed to reject auth request")?;
+    save_refreshed_access_token(new_access_token).await?;
+    respond_ack(sock).await
 }
 
 async fn unlock_state(
@@ -509,7 +1067,7 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
-    let mut db = load_db().await?;
+    let db = load_db_coordinated().await?;
 
     let access_token = if let Some(access_token) = &db.access_token {
         access_token.clone()
@@ -528,14 +1086,16 @@ pub async fn sync(
         .await
         .context("failed to sync database from server")?;
     state.lock().await.set_master_password_reprompt(&entries);
-    if let Some(access_token) = access_token {
-        db.access_token = Some(access_token);
-    }
-    db.protected_key = Some(protected_key);
-    db.protected_private_key = Some(protected_private_key);
-    db.protected_org_keys = protected_org_keys;
-    db.entries = entries;
-    save_db(&db).await?;
+    update_db(false, |db| {
+        if let Some(access_token) = access_token {
+            db.access_token = Some(access_token);
+        }
+        db.protected_key = Some(protected_key);
+        db.protected_private_key = Some(protected_private_key);
+        db.protected_org_keys = protected_org_keys;
+        db.entries = entries;
+    })
+    .await?;
 
     if let Err(e) = subscribe_to_notifications(state.clone()).await {
         eprintln!("failed to subscribe to notifications: {e}");
@@ -949,4 +1509,142 @@ pub async fn find_ssh_private_key(
     }
 
     Err(anyhow::anyhow!("No matching private key found"))
+}
+
+#[cfg(test)]
+mod device_auth_tests {
+    use super::*;
+
+    fn test_state(unlocked: bool) -> crate::state::State {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let (priv_key, org_keys) = if unlocked {
+            let mut material = rbw::locked::Vec::new();
+            material.extend(0_u8..64);
+            (
+                Some(rbw::locked::Keys::new(material)),
+                Some(std::collections::HashMap::new()),
+            )
+        } else {
+            (None, None)
+        };
+        crate::state::State {
+            priv_key,
+            org_keys,
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            timeout_duration: std::time::Duration::from_secs(60),
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_cancels_pending_device_request() {
+        let state =
+            std::sync::Arc::new(tokio::sync::Mutex::new(test_state(false)));
+        let mut cancellation = state.lock().await.cancellation();
+        let clear_state = state.clone();
+        let clear = async move {
+            tokio::task::yield_now().await;
+            clear_state.lock().await.clear();
+        };
+        let wait = cancel_or(&mut cancellation, std::future::pending::<()>());
+        let ((), result) = tokio::join!(clear, wait);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn clear_prevents_approval_key_release() {
+        let mut state = test_state(true);
+        let cancellation = state.cancellation();
+        let request = rbw::device_auth::RequestKeyPair::generate().unwrap();
+        state.clear();
+        let error = encrypt_approval_user_key(
+            &state,
+            &cancellation,
+            &request.public_key_base64(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn auth_request_ids_are_validated_before_url_construction() {
+        assert!(validate_auth_request_id(
+            "00000000-0000-0000-0000-000000000000"
+        )
+        .is_ok());
+        assert!(validate_auth_request_id("../../not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn auth_request_two_factor_selects_supported_provider() {
+        assert_eq!(
+            auth_request_two_factor_provider(&[
+                rbw::api::TwoFactorProviderType::Duo,
+                rbw::api::TwoFactorProviderType::Email,
+            ])
+            .unwrap(),
+            rbw::api::TwoFactorProviderType::Email,
+        );
+        assert!(auth_request_two_factor_provider(&[
+            rbw::api::TwoFactorProviderType::WebAuthn,
+        ])
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinated_db_update_reloads_and_preserves_unrelated_fields() {
+        let stale_snapshot = rbw::db::Db::new();
+        let backend = std::sync::Arc::new(std::sync::Mutex::new(
+            serde_json::to_string(&stale_snapshot).unwrap(),
+        ));
+
+        {
+            let mut newest: rbw::db::Db =
+                serde_json::from_str(&backend.lock().unwrap()).unwrap();
+            newest.protected_private_key =
+                Some("newer-unrelated-private-key".to_string());
+            *backend.lock().unwrap() =
+                serde_json::to_string(&newest).unwrap();
+        }
+
+        let load_backend = backend.clone();
+        let save_backend = backend.clone();
+        coordinated_db_update_with(
+            move || {
+                let json = load_backend.lock().unwrap().clone();
+                Box::pin(async move {
+                    serde_json::from_str(&json).map_err(anyhow::Error::new)
+                })
+            },
+            move |db| {
+                let json = serde_json::to_string(db).unwrap();
+                Box::pin(async move {
+                    *save_backend.lock().unwrap() = json;
+                    Ok(())
+                })
+            },
+            |db| db.access_token = Some("refreshed-token".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let saved: rbw::db::Db =
+            serde_json::from_str(&backend.lock().unwrap()).unwrap();
+        assert_eq!(saved.access_token.as_deref(), Some("refreshed-token"));
+        assert_eq!(
+            saved.protected_private_key.as_deref(),
+            Some("newer-unrelated-private-key")
+        );
+        assert!(stale_snapshot.protected_private_key.is_none());
+    }
 }

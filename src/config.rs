@@ -247,3 +247,35 @@ pub async fn device_id(config: &Config) -> Result<String> {
         Ok(id)
     }
 }
+
+/// Return the identifier of a device that has already been registered.
+/// Unlike `device_id`, this never creates a new identifier, since an
+/// auth-request made by an unknown device is invalid.
+pub async fn registered_device_id(config: &Config) -> Result<String> {
+    let file = crate::dirs::device_id_file();
+    match tokio::fs::File::open(&file).await {
+        Ok(mut fh) => {
+            let mut id = String::new();
+            fh.read_to_string(&mut id).await.map_err(|source| {
+                Error::LoadDeviceId {
+                    source,
+                    file: file.clone(),
+                }
+            })?;
+            let id = id.trim();
+            if id.is_empty() {
+                Err(Error::KnownDeviceRequired)
+            } else {
+                Ok(id.to_string())
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            config
+                .device_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or(Error::KnownDeviceRequired)
+        }
+        Err(source) => Err(Error::LoadDeviceId { source, file }),
+    }
+}

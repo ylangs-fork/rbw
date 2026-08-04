@@ -1341,6 +1341,125 @@ pub fn unlock() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn unlock_with_device() -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::unlock_with_device()?;
+    Ok(())
+}
+
+fn sort_auth_requests(requests: &mut [rbw::protocol::AuthRequestInfo]) {
+    requests.sort_by(|a, b| {
+        a.creation_date
+            .cmp(&b.creation_date)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn format_auth_request_row(
+    number: Option<usize>,
+    request: &rbw::protocol::AuthRequestInfo,
+) -> String {
+    let number = number.map_or_else(String::new, |n| format!("{n}\t"));
+    format!(
+        "{}{}\t{}\t{}\t{}\t{}",
+        number,
+        crate::actions::auth_request_display_field(&request.id),
+        crate::actions::auth_request_display_field(&request.device_type),
+        crate::actions::auth_request_display_field(&request.ip_address),
+        crate::actions::auth_request_display_field(&request.creation_date),
+        crate::actions::auth_request_display_field(&request.fingerprint),
+    )
+}
+
+fn resolve_auth_request_selector(
+    requests: &[rbw::protocol::AuthRequestInfo],
+    selector: Option<&str>,
+) -> anyhow::Result<String> {
+    match selector {
+        None => match requests.len() {
+            0 => Err(anyhow::anyhow!("no pending authentication requests")),
+            1 => Ok(requests[0].id.clone()),
+            _ => {
+                for (index, request) in requests.iter().enumerate() {
+                    eprintln!(
+                        "{}",
+                        format_auth_request_row(Some(index + 1), request)
+                    );
+                }
+                Err(anyhow::anyhow!(
+                    "multiple pending authentication requests; \
+                     specify a number or ID"
+                ))
+            }
+        },
+        Some(selector) => {
+            if selector.parse::<uuid::Uuid>().is_ok() {
+                return Ok(selector.to_string());
+            }
+            if let Ok(number) = selector.parse::<usize>() {
+                if number == 0 || number > requests.len() {
+                    return Err(anyhow::anyhow!(
+                        "invalid request number {number}; \
+                         valid range is 1..={}",
+                        requests.len()
+                    ));
+                }
+                return Ok(requests[number - 1].id.clone());
+            }
+            Err(anyhow::anyhow!(
+                "invalid selector '{selector}'; \
+                 must be a request ID or list number"
+            ))
+        }
+    }
+}
+
+pub fn auth_request_list(raw: bool) -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::login()?;
+    let mut requests = crate::actions::list_auth_requests()?;
+    sort_auth_requests(&mut requests);
+    if raw {
+        serde_json::to_writer_pretty(std::io::stdout(), &requests)?;
+        println!();
+    } else if requests.is_empty() {
+        println!("No pending authentication requests.");
+    } else {
+        for (index, request) in requests.iter().enumerate() {
+            println!("{}", format_auth_request_row(Some(index + 1), request));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_auth_request_id(selector: Option<&str>) -> anyhow::Result<String> {
+    if let Some(selector) = selector {
+        if selector.parse::<uuid::Uuid>().is_ok() {
+            return Ok(selector.to_string());
+        }
+    }
+    let mut requests = crate::actions::list_auth_requests()?;
+    sort_auth_requests(&mut requests);
+    resolve_auth_request_selector(&requests, selector)
+}
+
+pub fn auth_request_approve(id: Option<&str>) -> anyhow::Result<()> {
+    // An approval requires both an unlocked agent and fresh local system
+    // authentication. Existing password unlock behavior is preserved here.
+    unlock()?;
+    let id = resolve_auth_request_id(id)?;
+    crate::actions::approve_auth_request(&id)?;
+    Ok(())
+}
+
+pub fn auth_request_reject(id: Option<&str>) -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::login()?;
+    let id = resolve_auth_request_id(id)?;
+    crate::actions::reject_auth_request(&id)?;
+    Ok(())
+}
+
 pub fn unlocked() -> anyhow::Result<()> {
     // not ensure_agent, because we don't want `rbw unlocked` to start the
     // agent if it's not running
@@ -4174,5 +4293,129 @@ mod test {
                 notes: None,
             },
         )
+    }
+
+    fn make_auth_request(
+        id: &str,
+        creation_date: &str,
+    ) -> rbw::protocol::AuthRequestInfo {
+        rbw::protocol::AuthRequestInfo {
+            id: id.to_string(),
+            fingerprint: "test-fingerprint".to_string(),
+            device_type: "Linux".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            country_name: None,
+            creation_date: creation_date.to_string(),
+        }
+    }
+
+    #[test]
+    fn sort_auth_requests_deterministic() {
+        let mut requests = vec![
+            make_auth_request("b-id", "2025-01-02T00:00:00Z"),
+            make_auth_request("a-id", "2025-01-01T00:00:00Z"),
+            make_auth_request("c-id", "2025-01-01T00:00:00Z"),
+        ];
+        sort_auth_requests(&mut requests);
+        let ids: Vec<&str> = requests.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["a-id", "c-id", "b-id"]);
+    }
+
+    #[test]
+    fn resolve_selector_none_zero_pending() {
+        let requests: Vec<rbw::protocol::AuthRequestInfo> = vec![];
+        let err = resolve_auth_request_selector(&requests, None).unwrap_err();
+        assert!(
+            err.to_string().contains("no pending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_none_one_pending() {
+        let requests =
+            vec![make_auth_request("only-id", "2025-01-01T00:00:00Z")];
+        let id = resolve_auth_request_selector(&requests, None).unwrap();
+        assert_eq!(id, "only-id");
+    }
+
+    #[test]
+    fn resolve_selector_none_multiple_pending() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let err = resolve_auth_request_selector(&requests, None).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple pending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_uuid() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let requests =
+            vec![make_auth_request("other", "2025-01-01T00:00:00Z")];
+        let id =
+            resolve_auth_request_selector(&requests, Some(uuid)).unwrap();
+        assert_eq!(id, uuid);
+    }
+
+    #[test]
+    fn resolve_selector_index_one() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let id = resolve_auth_request_selector(&requests, Some("1")).unwrap();
+        assert_eq!(id, "first");
+    }
+
+    #[test]
+    fn resolve_selector_index_two() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let id = resolve_auth_request_selector(&requests, Some("2")).unwrap();
+        assert_eq!(id, "second");
+    }
+
+    #[test]
+    fn resolve_selector_index_out_of_range() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err =
+            resolve_auth_request_selector(&requests, Some("2")).unwrap_err();
+        assert!(
+            err.to_string().contains("valid range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_index_zero() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err =
+            resolve_auth_request_selector(&requests, Some("0")).unwrap_err();
+        assert!(
+            err.to_string().contains("valid range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_garbage() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err = resolve_auth_request_selector(&requests, Some("1abc"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be a request ID or list number"),
+            "unexpected error: {err}"
+        );
     }
 }

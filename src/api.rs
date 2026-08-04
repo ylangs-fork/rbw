@@ -302,6 +302,8 @@ struct ConnectTokenReq {
     two_factor_token: Option<String>,
     #[serde(rename = "twoFactorProvider")]
     two_factor_provider: Option<u32>,
+    #[serde(rename = "authRequest", skip_serializing_if = "Option::is_none")]
+    auth_request: Option<String>,
     #[serde(flatten)]
     auth: ConnectTokenAuth,
 }
@@ -384,6 +386,65 @@ struct SendEmailLoginReq {
         alias = "ssoEmail2faSessionToken"
     )]
     sso_email_2fa_session_token: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AuthRequestCreateReq {
+    access_code: String,
+    device_identifier: String,
+    email: String,
+    public_key: String,
+    #[serde(rename = "type")]
+    ty: u8,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AuthRequestUpdateReq {
+    device_identifier: String,
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_password_hash: Option<String>,
+    request_approved: bool,
+}
+
+#[derive(serde::Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct AuthRequest {
+    #[serde(rename = "Id", alias = "id")]
+    pub id: String,
+    #[serde(rename = "PublicKey", alias = "publicKey")]
+    pub public_key: String,
+    #[serde(rename = "RequestDeviceType", alias = "requestDeviceType")]
+    pub request_device_type: String,
+    #[serde(
+        rename = "RequestDeviceIdentifier",
+        alias = "requestDeviceIdentifier",
+        default
+    )]
+    pub request_device_identifier: Option<String>,
+    #[serde(rename = "RequestIpAddress", alias = "requestIpAddress")]
+    pub request_ip_address: String,
+    #[serde(
+        rename = "RequestCountryName",
+        alias = "requestCountryName",
+        default
+    )]
+    pub request_country_name: Option<String>,
+    #[serde(rename = "Key", alias = "key", default)]
+    pub key: Option<String>,
+    #[serde(rename = "CreationDate", alias = "creationDate")]
+    pub creation_date: String,
+    #[serde(rename = "ResponseDate", alias = "responseDate", default)]
+    pub response_date: Option<String>,
+    #[serde(rename = "RequestApproved", alias = "requestApproved", default)]
+    pub request_approved: Option<bool>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct AuthRequestsRes {
+    #[serde(rename = "Data", alias = "data")]
+    data: Vec<AuthRequest>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -943,6 +1004,7 @@ impl Client {
             device_push_token: String::new(),
             two_factor_token: None,
             two_factor_provider: None,
+            auth_request: None,
         };
         let client = self.reqwest_client().await?;
         let res = client
@@ -1002,6 +1064,7 @@ impl Client {
                         .map(std::string::ToString::to_string),
                     two_factor_provider: two_factor_provider
                         .map(|ty| ty as u32),
+                    auth_request: None,
                 }
             }
             None => ConnectTokenReq {
@@ -1020,6 +1083,7 @@ impl Client {
                 two_factor_token: two_factor_token
                     .map(std::string::ToString::to_string),
                 two_factor_provider: two_factor_provider.map(|ty| ty as u32),
+                auth_request: None,
             },
         };
 
@@ -1057,6 +1121,222 @@ impl Client {
                     Err(Error::RequestFailed { status: code })
                 }
             }
+        }
+    }
+
+    pub async fn login_with_auth_request(
+        &self,
+        email: &str,
+        device_id: &str,
+        access_code: &str,
+        request_id: &str,
+        two_factor_token: Option<&str>,
+        two_factor_provider: Option<TwoFactorProviderType>,
+    ) -> Result<(String, String, String)> {
+        let connect_req = ConnectTokenReq {
+            auth: ConnectTokenAuth::Password(ConnectTokenPassword {
+                username: email.to_string(),
+                password: access_code.to_string(),
+            }),
+            grant_type: "password".to_string(),
+            scope: "api offline_access".to_string(),
+            client_id: "cli".to_string(),
+            device_type: u32::from(DEVICE_TYPE),
+            device_identifier: device_id.to_string(),
+            device_name: "rbw".to_string(),
+            device_push_token: String::new(),
+            two_factor_token: two_factor_token.map(str::to_string),
+            two_factor_provider: two_factor_provider.map(|ty| ty as u32),
+            auth_request: Some(request_id.to_string()),
+        };
+        let client = self.reqwest_client().await?;
+        let res = client
+            .post(self.identity_url("/connect/token"))
+            .form(&connect_req)
+            .header(
+                "auth-email",
+                crate::base64::encode_url_safe_no_pad(email),
+            )
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest {
+                source: source.without_url(),
+            })?;
+        if res.status() == reqwest::StatusCode::OK {
+            let connect_res: ConnectTokenRes = auth_request_json(res).await?;
+            Ok((
+                connect_res.access_token,
+                connect_res.refresh_token,
+                connect_res.key,
+            ))
+        } else {
+            let code = res.status().as_u16();
+            res.text().await.map_or_else(
+                |_| Err(Error::RequestFailed { status: code }),
+                |body| {
+                    body.json_with_path().map_or_else(
+                        |_| Err(Error::RequestFailed { status: code }),
+                        |json| {
+                            Err(classify_auth_request_login_error(
+                                &json, code,
+                            ))
+                        },
+                    )
+                },
+            )
+        }
+    }
+
+    pub async fn create_auth_request(
+        &self,
+        email: &str,
+        device_id: &str,
+        public_key: &str,
+        access_code: &str,
+    ) -> Result<AuthRequest> {
+        let request = AuthRequestCreateReq {
+            access_code: access_code.to_string(),
+            device_identifier: device_id.to_string(),
+            email: email.to_string(),
+            public_key: public_key.to_string(),
+            ty: 0,
+        };
+        let client = self.reqwest_client().await?;
+        let res = client
+            .post(self.api_url("/auth-requests"))
+            .header("Device-Identifier", device_id)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest {
+                source: source.without_url(),
+            })?;
+        Self::auth_request_response(res, false).await
+    }
+
+    pub async fn get_auth_request_response(
+        &self,
+        request_id: &str,
+        access_code: &str,
+    ) -> Result<AuthRequest> {
+        let client = self.reqwest_client().await?;
+        let res =
+            client
+                .get(self.api_url(&format!(
+                    "/auth-requests/{request_id}/response"
+                )))
+                .query(&[("code", access_code)])
+                .send()
+                .await
+                .map_err(|source| Error::Reqwest {
+                    source: source.without_url(),
+                })?;
+        Self::auth_request_response(res, true).await
+    }
+
+    pub async fn pending_auth_requests(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<AuthRequest>> {
+        let client = self.reqwest_client().await?;
+        let mut res = client
+            .get(self.api_url("/auth-requests/pending"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest { source })?;
+        // Vaultwarden versions before the official pending route expose the
+        // same filtered list at /auth-requests.
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            res = client
+                .get(self.api_url("/auth-requests"))
+                .bearer_auth(access_token)
+                .send()
+                .await
+                .map_err(|source| Error::Reqwest { source })?;
+        }
+        match res.status() {
+            reqwest::StatusCode::OK => {
+                let response: AuthRequestsRes = res.json_with_path().await?;
+                Ok(response.data)
+            }
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
+    pub async fn get_auth_request(
+        &self,
+        access_token: &str,
+        request_id: &str,
+    ) -> Result<AuthRequest> {
+        let client = self.reqwest_client().await?;
+        let res = client
+            .get(self.api_url(&format!("/auth-requests/{request_id}")))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest { source })?;
+        Self::authenticated_auth_request_response(res).await
+    }
+
+    pub async fn update_auth_request(
+        &self,
+        access_token: &str,
+        request_id: &str,
+        device_id: &str,
+        key: &str,
+        approved: bool,
+    ) -> Result<AuthRequest> {
+        let request = AuthRequestUpdateReq {
+            device_identifier: device_id.to_string(),
+            key: key.to_string(),
+            master_password_hash: None,
+            request_approved: approved,
+        };
+        let client = self.reqwest_client().await?;
+        let res = client
+            .put(self.api_url(&format!("/auth-requests/{request_id}")))
+            .bearer_auth(access_token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|source| Error::Reqwest { source })?;
+        Self::authenticated_auth_request_response(res).await
+    }
+
+    async fn auth_request_response(
+        res: reqwest::Response,
+        map_unavailable: bool,
+    ) -> Result<AuthRequest> {
+        if res.status() == reqwest::StatusCode::OK {
+            auth_request_json(res).await
+        } else if map_unavailable
+            && matches!(
+                res.status(),
+                reqwest::StatusCode::BAD_REQUEST
+                    | reqwest::StatusCode::NOT_FOUND
+            )
+        {
+            Err(Error::AuthRequestUnavailable)
+        } else {
+            Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            })
+        }
+    }
+
+    async fn authenticated_auth_request_response(
+        res: reqwest::Response,
+    ) -> Result<AuthRequest> {
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            Err(Error::RequestUnauthorized)
+        } else {
+            Self::auth_request_response(res, false).await
         }
     }
 
@@ -1707,6 +1987,53 @@ fn sso_query_code(
     Ok(sso_code.clone())
 }
 
+async fn auth_request_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
+    let bytes = response.bytes().await.map_err(|source| Error::Reqwest {
+        source: source.without_url(),
+    })?;
+    let deserializer = &mut serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize(deserializer)
+        .map_err(|source| Error::Json { source })
+}
+
+fn classify_auth_request_login_error(
+    error_res: &ConnectErrorRes,
+    code: u16,
+) -> Error {
+    if error_res.error == "invalid_grant"
+        && error_res.error_description.as_deref()
+            == Some("Two factor required.")
+    {
+        if let Some(providers) = error_res.two_factor_providers.as_ref() {
+            return Error::TwoFactorRequired {
+                providers: providers.clone(),
+                sso_email_2fa_session_token: error_res
+                    .sso_email_2fa_session_token
+                    .clone(),
+            };
+        }
+    }
+
+    let fixed_verification_failure = error_res.error == "invalid_grant"
+        && (error_res.error_description.as_deref()
+            == Some("invalid_username_or_password")
+            || error_res.error_description.as_deref() == Some("")
+            || error_res.error_description.is_none());
+    let vaultwarden_verification_failure = error_res.error.is_empty()
+        && error_res.error_model.is_some()
+        && (error_res.error_description.as_deref() == Some("")
+            || error_res.error_description.is_none());
+    if fixed_verification_failure || vaultwarden_verification_failure {
+        return Error::IncorrectPassword {
+            message: "Two factor verification failed".to_string(),
+        };
+    }
+
+    Error::RequestFailed { status: code }
+}
+
 fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
     let error_desc = error_res.error_description.clone();
     let error_desc = error_desc.as_deref();
@@ -1765,4 +2092,292 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
 
     log::warn!("unexpected error received during login: {error_res:?}");
     Error::RequestFailed { status: code }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    #[test]
+    fn auth_request_create_wire_format_matches_bitwarden() {
+        let request = AuthRequestCreateReq {
+            access_code: "A234567890123456789012345".to_string(),
+            device_identifier: "device-id".to_string(),
+            email: "user@example.com".to_string(),
+            public_key: "spki-base64".to_string(),
+            ty: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "accessCode": "A234567890123456789012345",
+                "deviceIdentifier": "device-id",
+                "email": "user@example.com",
+                "publicKey": "spki-base64",
+                "type": 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn auth_request_token_exchange_uses_request_id_and_access_code() {
+        let request = ConnectTokenReq {
+            grant_type: "password".to_string(),
+            scope: "api offline_access".to_string(),
+            client_id: "cli".to_string(),
+            device_type: 8,
+            device_identifier: "device-id".to_string(),
+            device_name: "rbw".to_string(),
+            device_push_token: String::new(),
+            two_factor_token: None,
+            two_factor_provider: None,
+            auth_request: Some("request-id".to_string()),
+            auth: ConnectTokenAuth::Password(ConnectTokenPassword {
+                username: "user@example.com".to_string(),
+                password: "access-code".to_string(),
+            }),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["authRequest"], "request-id");
+        assert_eq!(value["password"], "access-code");
+        assert_eq!(value["deviceIdentifier"], "device-id");
+        assert_eq!(value["deviceType"], 8);
+    }
+
+    #[test]
+    fn auth_request_response_accepts_vaultwarden_camel_case() {
+        let response: AuthRequest =
+            serde_json::from_value(serde_json::json!({
+                "id": "request-id",
+                "publicKey": "spki-base64",
+                "requestDeviceType": "Linux Desktop",
+                "requestIpAddress": "192.0.2.1",
+                "key": null,
+                "creationDate": "2026-01-01T00:00:00Z",
+                "responseDate": null,
+                "requestApproved": false,
+            }))
+            .unwrap();
+        assert_eq!(response.id, "request-id");
+        assert_eq!(response.request_approved, Some(false));
+        assert!(response.response_date.is_none());
+        assert!(response.key.is_none());
+    }
+
+    #[test]
+    fn auth_request_two_factor_error_is_classified() {
+        let response: ConnectErrorRes =
+            serde_json::from_value(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Two factor required.",
+                "TwoFactorProviders": [0, 1],
+                "SsoEmail2faSessionToken": "email-session",
+            }))
+            .unwrap();
+        let error = classify_auth_request_login_error(&response, 400);
+        match error {
+            Error::TwoFactorRequired {
+                providers,
+                sso_email_2fa_session_token,
+            } => {
+                assert_eq!(
+                    providers,
+                    vec![
+                        TwoFactorProviderType::Authenticator,
+                        TwoFactorProviderType::Email,
+                    ]
+                );
+                assert_eq!(
+                    sso_email_2fa_session_token.as_deref(),
+                    Some("email-session")
+                );
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_request_structured_error_does_not_reflect_server_text() {
+        const ACCESS_CODE: &str = "SECRET-ACCESS-CODE-SENTINEL";
+        const SERVER_MESSAGE: &str =
+            "server reflected SECRET-ACCESS-CODE-SENTINEL";
+        let body = serde_json::json!({
+            "error": "",
+            "error_description": "",
+            "ErrorModel": { "Message": SERVER_MESSAGE },
+        })
+        .to_string();
+        let base = response_server("400 Bad Request", &body).await;
+        let client = Client::new(&base, &base, &base, None);
+        let error = client
+            .login_with_auth_request(
+                "user@example.com",
+                "device-id",
+                ACCESS_CODE,
+                "00000000-0000-0000-0000-000000000000",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(ACCESS_CODE));
+        assert!(!rendered.contains(SERVER_MESSAGE));
+        assert!(matches!(error, Error::IncorrectPassword { .. }));
+    }
+
+    #[test]
+    fn auth_request_two_factor_fields_are_serialized() {
+        let request = ConnectTokenReq {
+            grant_type: "password".to_string(),
+            scope: "api offline_access".to_string(),
+            client_id: "cli".to_string(),
+            device_type: 8,
+            device_identifier: "device-id".to_string(),
+            device_name: "rbw".to_string(),
+            device_push_token: String::new(),
+            two_factor_token: Some("123456".to_string()),
+            two_factor_provider: Some(
+                TwoFactorProviderType::Authenticator as u32,
+            ),
+            auth_request: Some("request-id".to_string()),
+            auth: ConnectTokenAuth::Password(ConnectTokenPassword {
+                username: "user@example.com".to_string(),
+                password: "access-code".to_string(),
+            }),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["twoFactorToken"], "123456");
+        assert_eq!(value["twoFactorProvider"], 0);
+        assert_eq!(value["authRequest"], "request-id");
+    }
+
+    async fn response_server(status: &str, body: &str) -> String {
+        let listener =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn status_server(status: &str) -> String {
+        response_server(status, "").await
+    }
+
+    #[tokio::test]
+    async fn auth_request_poll_maps_rejected_or_missing_statuses() {
+        for status in ["400 Bad Request", "404 Not Found"] {
+            let base = status_server(status).await;
+            let client = Client::new(&base, &base, &base, None);
+            assert!(matches!(
+                client
+                    .get_auth_request_response(
+                        "00000000-0000-0000-0000-000000000000",
+                        "code"
+                    )
+                    .await,
+                Err(Error::AuthRequestUnavailable)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_request_poll_keeps_other_statuses_distinct() {
+        let base = status_server("500 Internal Server Error").await;
+        let client = Client::new(&base, &base, &base, None);
+        assert!(matches!(
+            client
+                .get_auth_request_response(
+                    "00000000-0000-0000-0000-000000000000",
+                    "code"
+                )
+                .await,
+            Err(Error::RequestFailed { status: 500 })
+        ));
+
+        let base = status_server("400 Bad Request").await;
+        let client = Client::new(&base, &base, &base, None);
+        assert!(matches!(
+            client
+                .create_auth_request(
+                    "user@example.com",
+                    "00000000-0000-0000-0000-000000000000",
+                    "public-key",
+                    "code"
+                )
+                .await,
+            Err(Error::RequestFailed { status: 400 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_request_response_parse_error_does_not_expose_access_code() {
+        const SENTINEL: &str = "SECRET-RESPONSE-CODE-SENTINEL";
+        let base = status_server("200 OK").await;
+        let client = Client::new(&base, &base, &base, None);
+        let error = client
+            .get_auth_request_response(
+                "00000000-0000-0000-0000-000000000000",
+                SENTINEL,
+            )
+            .await
+            .unwrap_err();
+        let chain = format!("{:#}", anyhow::Error::new(error));
+        assert!(!chain.contains(SENTINEL), "error leaked access code");
+    }
+
+    #[tokio::test]
+    async fn auth_request_transport_error_does_not_expose_access_code() {
+        const SENTINEL: &str = "SECRET-ACCESS-CODE-SENTINEL";
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let base = format!("http://{address}");
+        let client = Client::new(&base, &base, &base, None);
+        let error = client
+            .get_auth_request_response(
+                "00000000-0000-0000-0000-000000000000",
+                SENTINEL,
+            )
+            .await
+            .unwrap_err();
+        let chain = format!("{:#}", anyhow::Error::new(error));
+        assert!(!chain.contains(SENTINEL), "error leaked access code");
+    }
+
+    #[test]
+    fn rejection_wire_format_does_not_claim_approval() {
+        let request = AuthRequestUpdateReq {
+            device_identifier: "device-id".to_string(),
+            key: String::new(),
+            master_password_hash: None,
+            request_approved: false,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["requestApproved"], false);
+        assert_eq!(value["key"], "");
+        assert!(value.get("masterPasswordHash").is_none());
+    }
 }

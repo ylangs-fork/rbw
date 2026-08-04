@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+## Added
+
+* Added native Login with device support, including manual local-authentication-gated
+  approval and rejection of authentication requests. Pending requests can be
+  selected by list number or request ID; the ID can be omitted when only one
+  request is pending.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added

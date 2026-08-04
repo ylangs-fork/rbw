@@ -167,9 +167,11 @@ impl CipherString {
                 ciphertext,
                 mac.as_deref(),
             )?;
-            cipher
+            let plaintext_len = cipher
                 .decrypt_padded_mut::<block_padding::Pkcs7>(res.data_mut())
-                .map_err(|source| Error::Decrypt { source })?;
+                .map_err(|source| Error::Decrypt { source })?
+                .len();
+            res.truncate(plaintext_len);
             Ok(res)
         } else {
             Err(Error::InvalidCipherString {
@@ -184,10 +186,23 @@ impl CipherString {
         &self,
         private_key: &crate::locked::PrivateKey,
     ) -> Result<crate::locked::Vec> {
+        let privkey_data = private_key.private_key();
+        let privkey_data = pkcs7_unpad(privkey_data).ok_or(Error::Padding)?;
+        self.decrypt_locked_asymmetric_der_bytes(privkey_data)
+    }
+
+    pub(crate) fn decrypt_locked_asymmetric_der(
+        &self,
+        private_key: &crate::locked::PrivateKey,
+    ) -> Result<crate::locked::Vec> {
+        self.decrypt_locked_asymmetric_der_bytes(private_key.private_key())
+    }
+
+    fn decrypt_locked_asymmetric_der_bytes(
+        &self,
+        privkey_data: &[u8],
+    ) -> Result<crate::locked::Vec> {
         if let Self::Asymmetric { ciphertext } = self {
-            let privkey_data = private_key.private_key();
-            let privkey_data =
-                pkcs7_unpad(privkey_data).ok_or(Error::Padding)?;
             let pkey = rsa::RsaPrivateKey::from_pkcs8_der(privkey_data)
                 .map_err(|source| Error::RsaPkcs8 { source })?;
             let mut bytes = pkey
@@ -290,6 +305,60 @@ fn pkcs7_unpad(b: &[u8]) -> Option<&[u8]> {
     }
 
     Some(&b[..b.len() - padding_len])
+}
+
+#[test]
+fn locked_symmetric_decryption_truncates_pkcs7_padding() {
+    let mut material = crate::locked::Vec::new();
+    material.extend(0_u8..64);
+    let keys = crate::locked::Keys::new(material);
+    let plaintext = [42_u8; crate::locked::KEYS_LEN];
+    let cipherstring = CipherString::encrypt_symmetric(&keys, &plaintext)
+        .expect("encryption succeeds");
+    let CipherString::Symmetric { ciphertext, .. } = &cipherstring else {
+        unreachable!();
+    };
+    assert_eq!(ciphertext.len(), 80);
+
+    let decrypted = cipherstring
+        .decrypt_locked_symmetric(&keys)
+        .expect("decryption succeeds");
+    assert_eq!(decrypted.data(), plaintext);
+    assert_eq!(decrypted.data().len(), crate::locked::KEYS_LEN);
+}
+
+#[test]
+fn locked_symmetric_decryption_rejects_invalid_mac_and_padding() {
+    let mut material = crate::locked::Vec::new();
+    material.extend(0_u8..64);
+    let keys = crate::locked::Keys::new(material);
+    let plaintext = [42_u8; crate::locked::KEYS_LEN];
+    let mut invalid_mac =
+        CipherString::encrypt_symmetric(&keys, &plaintext).unwrap();
+    let CipherString::Symmetric { mac, .. } = &mut invalid_mac else {
+        unreachable!();
+    };
+    mac.as_mut().unwrap()[0] ^= 1;
+    assert!(matches!(
+        invalid_mac.decrypt_locked_symmetric(&keys),
+        Err(Error::InvalidMac)
+    ));
+
+    let mut invalid_padding =
+        CipherString::encrypt_symmetric(&keys, &plaintext).unwrap();
+    let CipherString::Symmetric {
+        ciphertext, mac, ..
+    } = &mut invalid_padding
+    else {
+        unreachable!();
+    };
+    *mac = None;
+    let last = ciphertext.len() - 1;
+    ciphertext[last] ^= 1;
+    assert!(matches!(
+        invalid_padding.decrypt_locked_symmetric(&keys),
+        Err(Error::Decrypt { .. })
+    ));
 }
 
 #[test]
