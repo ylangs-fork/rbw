@@ -1,7 +1,9 @@
 use sha2::Digest as _;
 
 pub struct State {
-    pub priv_key: Option<rbw::locked::Keys>,
+    // HOOK(shatter): state-machine must preserve this wrapped representation
+    // when adding L1 metadata and should use `with_key` for all access.
+    pub priv_key: Option<rbw::locked_shatter::ShatteredKeys>,
     pub org_keys:
         Option<std::collections::HashMap<String, rbw::locked::Keys>>,
     pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
@@ -30,10 +32,16 @@ pub struct State {
 }
 
 impl State {
-    pub fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
-        org_id.map_or(self.priv_key.as_ref(), |id| {
-            self.org_keys.as_ref().and_then(|h| h.get(id))
-        })
+    pub fn with_key<R>(
+        &self,
+        org_id: Option<&str>,
+        f: impl FnOnce(&rbw::locked::Keys) -> R,
+    ) -> Option<R> {
+        if let Some(id) = org_id {
+            self.org_keys.as_ref().and_then(|keys| keys.get(id)).map(f)
+        } else {
+            self.priv_key.as_ref().map(|keys| keys.with_unsealed(f))
+        }
     }
 
     pub fn needs_unlock(&self) -> bool {
@@ -184,7 +192,7 @@ mod tests {
         let (sync_timeout, _sync_timeout_receiver) =
             crate::timeout::Timeout::new();
         let mut state = State {
-            priv_key: Some(keys()),
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
             org_keys: Some(std::collections::HashMap::new()),
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
