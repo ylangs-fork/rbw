@@ -5,6 +5,7 @@ pub struct Agent {
     timer_r: tokio::sync::mpsc::UnboundedReceiver<()>,
     sync_timer_r: tokio::sync::mpsc::UnboundedReceiver<()>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    memory_guard: crate::memory_guard::MemoryGuard,
 }
 
 impl Agent {
@@ -12,11 +13,13 @@ impl Agent {
         timer_r: tokio::sync::mpsc::UnboundedReceiver<()>,
         sync_timer_r: tokio::sync::mpsc::UnboundedReceiver<()>,
         state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+        memory_guard: crate::memory_guard::MemoryGuard,
     ) -> Self {
         Self {
             timer_r,
             sync_timer_r,
             state,
+            memory_guard,
         }
     }
 
@@ -70,10 +73,12 @@ impl Agent {
                         res.context("failed to accept incoming connection")?,
                     );
                     let state = self.state.clone();
+                    let memory_guard = self.memory_guard.clone();
                     tokio::spawn(async move {
                         let res = Box::pin(handle_request(
                             &mut sock,
                             state.clone(),
+                            &memory_guard,
                         ))
                         .await;
                         if let Err(e) = res {
@@ -115,6 +120,7 @@ impl Agent {
 async fn handle_request(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    memory_guard: &crate::memory_guard::MemoryGuard,
 ) -> anyhow::Result<()> {
     let req = sock.recv().await?;
     let req = match req {
@@ -125,6 +131,10 @@ async fn handle_request(
         }
     };
     let (action, environment) = req.into_parts();
+    // RAM defense: reject/abort if the agent is being traced (C3/C4).
+    // Covers all actions; cost is one small procfs read.
+    memory_guard.enforce(&state).await?;
+    // Sensitive actions require a fresh bio (re)authorization (B3).
     if sensitive_action(&action) {
         gate_sensitive_action(state.clone(), &environment).await?;
     }

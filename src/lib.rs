@@ -11,6 +11,7 @@ pub mod error;
 pub mod identity;
 pub mod json;
 pub mod locked;
+pub mod locked_shatter;
 pub mod pam_gate;
 pub mod pinentry;
 mod prelude;

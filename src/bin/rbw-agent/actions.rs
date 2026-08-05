@@ -361,7 +361,8 @@ async fn login_success(
     match res {
         Ok((keys, org_keys)) => {
             let mut state = state.lock().await;
-            state.priv_key = Some(keys);
+            state.priv_key =
+                Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
             state.org_keys = Some(org_keys);
         }
         Err(e) => return Err(e).context("failed to unlock database"),
@@ -787,7 +788,7 @@ pub async fn unlock_with_device(
     {
         let mut state = state.lock().await;
         ensure_not_cancelled(&cancellation)?;
-        state.priv_key = Some(key);
+        state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&key));
         state.org_keys = Some(org_keys);
         state.begin_l1_session();
     }
@@ -824,11 +825,14 @@ fn encrypt_approval_user_key(
     public_key: &str,
 ) -> anyhow::Result<String> {
     ensure_not_cancelled(cancellation)?;
-    let user_key = state.key(None).ok_or_else(|| {
-        anyhow::anyhow!("agent locked during local system authentication")
-    })?;
-    rbw::device_auth::encrypt_user_key(public_key, user_key)
-        .context("failed to encrypt user key for auth request")
+    state
+        .with_key(None, |user_key| {
+            rbw::device_auth::encrypt_user_key(public_key, user_key)
+                .context("failed to encrypt user key for auth request")
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent locked during local system authentication")
+        })?
 }
 
 pub async fn approve_auth_request(
@@ -1074,7 +1078,7 @@ async fn unlock_success(
     org_keys: std::collections::HashMap<String, rbw::locked::Keys>,
 ) -> anyhow::Result<()> {
     let mut state = state.lock().await;
-    state.priv_key = Some(keys);
+    state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
     state.org_keys = Some(org_keys);
     state.begin_l1_session();
     Ok(())
@@ -1161,24 +1165,6 @@ async fn decrypt_cipher(
         let db = load_db().await?;
         state.set_master_password_reprompt(&db.entries);
     }
-    let Some(keys) = state.key(org_id) else {
-        return Err(anyhow::anyhow!(
-            "failed to find decryption keys in in-memory state"
-        ));
-    };
-    let entry_key = if let Some(entry_key) = entry_key {
-        let key_cipherstring =
-            rbw::cipherstring::CipherString::new(entry_key)
-                .context("failed to parse individual item encryption key")?;
-        Some(rbw::locked::Keys::new(
-            key_cipherstring.decrypt_locked_symmetric(keys).context(
-                "failed to decrypt individual item encryption key",
-            )?,
-        ))
-    } else {
-        None
-    };
-
     let mut sha256 = sha2::Sha256::new();
     sha256.update(cipherstring);
     let master_password_reprompt: [u8; 32] = sha256.finalize().into();
@@ -1261,16 +1247,36 @@ async fn decrypt_cipher(
         }
     }
 
-    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
-        .context("failed to parse encrypted secret")?;
-    let plaintext = String::from_utf8(
-        cipherstring
-            .decrypt_symmetric(keys, entry_key.as_ref())
-            .context("failed to decrypt encrypted secret")?,
-    )
-    .context("failed to parse decrypted secret")?;
-
-    Ok(plaintext)
+    state
+        .with_key(org_id, |keys| {
+            let entry_key = if let Some(entry_key) = entry_key {
+                let key_cipherstring = rbw::cipherstring::CipherString::new(
+                    entry_key,
+                )
+                .context("failed to parse individual item encryption key")?;
+                Some(rbw::locked::Keys::new(
+                    key_cipherstring.decrypt_locked_symmetric(keys).context(
+                        "failed to decrypt individual item encryption key",
+                    )?,
+                ))
+            } else {
+                None
+            };
+            let cipherstring =
+                rbw::cipherstring::CipherString::new(cipherstring)
+                    .context("failed to parse encrypted secret")?;
+            String::from_utf8(
+                cipherstring
+                    .decrypt_symmetric(keys, entry_key.as_ref())
+                    .context("failed to decrypt encrypted secret")?,
+            )
+            .context("failed to parse decrypted secret")
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to find decryption keys in in-memory state"
+            )
+        })?
 }
 
 pub async fn decrypt(
@@ -1296,16 +1302,19 @@ pub async fn encrypt(
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = state.lock().await;
-    let Some(keys) = state.key(org_id) else {
-        return Err(anyhow::anyhow!(
-            "failed to find encryption keys in in-memory state"
-        ));
-    };
-    let cipherstring = rbw::cipherstring::CipherString::encrypt_symmetric(
-        keys,
-        plaintext.as_bytes(),
-    )
-    .context("failed to encrypt plaintext secret")?;
+    let cipherstring = state
+        .with_key(org_id, |keys| {
+            rbw::cipherstring::CipherString::encrypt_symmetric(
+                keys,
+                plaintext.as_bytes(),
+            )
+            .context("failed to encrypt plaintext secret")
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to find encryption keys in in-memory state"
+            )
+        })??;
 
     respond_encrypt(sock, cipherstring.to_string()).await?;
 
@@ -1562,7 +1571,9 @@ mod device_auth_tests {
             let mut material = rbw::locked::Vec::new();
             material.extend(0_u8..64);
             (
-                Some(rbw::locked::Keys::new(material)),
+                Some(rbw::locked_shatter::ShatteredKeys::seal(
+                    &rbw::locked::Keys::new(material),
+                )),
                 Some(std::collections::HashMap::new()),
             )
         } else {

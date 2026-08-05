@@ -108,6 +108,10 @@ impl Keys {
         self.keys.data()
     }
 
+    pub(crate) fn zeroize(&mut self) {
+        self.keys.zero();
+    }
+
     pub fn enc_key(&self) -> &[u8] {
         &self.keys.data()[0..32]
     }

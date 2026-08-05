@@ -4,7 +4,9 @@ pub const REMOTE_L1_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
 pub struct State {
-    pub priv_key: Option<rbw::locked::Keys>,
+    // HOOK(shatter): state-machine must preserve this wrapped representation
+    // when adding L1 metadata and should use `with_key` for all access.
+    pub priv_key: Option<rbw::locked_shatter::ShatteredKeys>,
     pub org_keys:
         Option<std::collections::HashMap<String, rbw::locked::Keys>>,
     pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
@@ -42,12 +44,22 @@ impl State {
         self.priv_key.is_some() && self.org_keys.is_some()
     }
 
-    pub fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
-        self.l1_alive().then(|| {
-            org_id.map_or(self.priv_key.as_ref(), |id| {
-                self.org_keys.as_ref().and_then(|h| h.get(id))
-            })
-        })?
+    /// Access the user/org key material inside a closure so the plaintext
+    /// only exists transiently (ShatteredKeys). Gated by L1 liveness: returns
+    /// None when the L1 session has expired (caller must re-unlock).
+    pub fn with_key<R>(
+        &self,
+        org_id: Option<&str>,
+        f: impl FnOnce(&rbw::locked::Keys) -> R,
+    ) -> Option<R> {
+        if !self.l1_alive() {
+            return None;
+        }
+        if let Some(id) = org_id {
+            self.org_keys.as_ref().and_then(|keys| keys.get(id)).map(f)
+        } else {
+            self.priv_key.as_ref().map(|keys| keys.with_unsealed(f))
+        }
     }
 
     pub fn needs_unlock(&self) -> bool {
@@ -229,7 +241,7 @@ mod tests {
         let (sync_timeout, _sync_timeout_receiver) =
             crate::timeout::Timeout::new();
         let mut state = State {
-            priv_key: Some(keys()),
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
             org_keys: Some(std::collections::HashMap::new()),
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
@@ -264,7 +276,7 @@ mod tests {
         let (sync_timeout, _sync_timeout_receiver) =
             crate::timeout::Timeout::new();
         let mut state = State {
-            priv_key: Some(keys()),
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
             org_keys: Some(std::collections::HashMap::new()),
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
@@ -286,11 +298,11 @@ mod tests {
         };
         assert!(!state.l1_alive());
         assert!(state.needs_unlock());
-        assert!(state.key(None).is_none());
+        assert!(state.with_key(None, |_| ()).is_none());
         state.record_bio_success();
         assert!(state.l1_alive());
         assert!(!state.needs_unlock());
-        assert!(state.key(None).is_some());
+        assert!(state.with_key(None, |_| ()).is_some());
     }
 
     #[test]
@@ -312,7 +324,7 @@ mod tests {
         let (sync_timeout, _sync_timeout_receiver) =
             crate::timeout::Timeout::new();
         let state = State {
-            priv_key: Some(keys()),
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
             org_keys: Some(std::collections::HashMap::new()),
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
