@@ -18,6 +18,8 @@ pub struct Config {
     pub sync_interval: u64,
     #[serde(default = "default_pinentry")]
     pub pinentry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_helper: Option<String>,
     pub client_cert_path: Option<std::path::PathBuf>,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
@@ -36,6 +38,7 @@ impl Default for Config {
             lock_timeout: default_lock_timeout(),
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
+            unlock_helper: None,
             client_cert_path: None,
             device_id: None,
         }

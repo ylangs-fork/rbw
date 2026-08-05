@@ -1926,6 +1926,7 @@ dependencies = [
  "serde_repr",
  "sha1",
  "sha2",
+ "shlex",
  "signature",
  "ssh-agent-lib",
  "tempfile",

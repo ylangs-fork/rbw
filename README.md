@@ -99,6 +99,17 @@ configuration options:
 * `pinentry`: The
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
+* `unlock_helper`: Optional shell-style command invoked during `rbw unlock`
+  before pinentry is consulted. The command is split with
+  [`shlex`](https://docs.rs/shlex/), executed with an empty environment, no
+  stdin, and a 30-second timeout. The helper must print `OK <hex>` to stdout
+  (optionally followed by a newline), where `<hex>` decodes to exactly 64
+  bytes representing the raw User Key. Any failure (spawn error, non-zero
+  exit, timeout, malformed output, wrong length) prints a short generic
+  message to stderr and falls back to the normal pinentry-based unlock.
+  Set with `rbw config set unlock_helper <cmd>`; clear with
+  `rbw config unset unlock_helper` or by passing an empty value:
+  `rbw config set unlock_helper ""`.
 
 ### Profiles
 

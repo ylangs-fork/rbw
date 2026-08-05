@@ -183,6 +183,9 @@ pub enum Action {
     Login,
     Register,
     Unlock,
+    UnlockWithUserKey {
+        key: UserKeyMaterial,
+    },
     UnlockWithDevice,
     ListAuthRequests,
     ApproveAuthRequest {
@@ -208,6 +211,61 @@ pub enum Action {
     },
     Quit,
     Version,
+}
+
+pub struct UserKeyMaterial([u8; crate::locked::KEYS_LEN]);
+
+impl UserKeyMaterial {
+    pub fn new(bytes: [u8; crate::locked::KEYS_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; crate::locked::KEYS_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for UserKeyMaterial {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str("UserKeyMaterial([REDACTED])")
+    }
+}
+
+impl serde::Serialize for UserKeyMaterial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&crate::base64::encode(&self.0))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UserKeyMaterial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let decoded = crate::base64::decode(&encoded)
+            .map_err(serde::de::Error::custom)?;
+        let bytes = decoded.try_into().map_err(|decoded: Vec<u8>| {
+            serde::de::Error::invalid_length(
+                decoded.len(),
+                &"a 64-byte Bitwarden User Key",
+            )
+        })?;
+        Ok(Self(bytes))
+    }
+}
+
+impl Drop for UserKeyMaterial {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -272,6 +330,33 @@ mod tests {
                 "id": "00000000-0000-0000-0000-000000000000",
             }),
         );
+    }
+
+    #[test]
+    fn raw_user_key_material_is_redacted_and_strictly_sized() {
+        let action = Action::UnlockWithUserKey {
+            key: UserKeyMaterial::new([0xabu8; crate::locked::KEYS_LEN]),
+        };
+        let debug = format!("{action:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("abab"));
+
+        let encoded = serde_json::to_value(&action).unwrap();
+        let decoded: Action = serde_json::from_value(encoded).unwrap();
+        match decoded {
+            Action::UnlockWithUserKey { key } => {
+                assert_eq!(
+                    key.as_bytes(),
+                    &[0xabu8; crate::locked::KEYS_LEN]
+                );
+            }
+            _ => panic!("wrong action variant"),
+        }
+        assert!(serde_json::from_value::<Action>(serde_json::json!({
+            "type": "UnlockWithUserKey",
+            "key": crate::base64::encode(&[0_u8; 63]),
+        }))
+        .is_err());
     }
 
     #[test]

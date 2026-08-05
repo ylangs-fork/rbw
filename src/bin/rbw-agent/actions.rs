@@ -1016,6 +1016,34 @@ async fn unlock_state(
     Ok(())
 }
 
+pub async fn unlock_with_user_key(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    user_key: &[u8; rbw::locked::KEYS_LEN],
+) -> anyhow::Result<()> {
+    if !state.lock().await.needs_unlock() {
+        return respond_ack(sock).await;
+    }
+
+    let db = load_db().await?;
+    let protected_private_key =
+        db.protected_private_key.ok_or_else(|| {
+            anyhow::anyhow!("failed to find protected private key in db")
+        })?;
+    let mut material = rbw::locked::Vec::new();
+    material.extend(user_key.iter().copied());
+    let (keys, org_keys) = rbw::actions::unlock_with_user_key(
+        rbw::locked::Keys::new(material),
+        &protected_private_key,
+        &db.protected_org_keys,
+    )
+    .context(
+        "unlock helper returned a User Key that cannot unlock this vault",
+    )?;
+    unlock_success(state, keys, org_keys).await?;
+    respond_ack(sock).await
+}
+
 pub async fn unlock(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,

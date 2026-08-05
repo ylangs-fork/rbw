@@ -30,6 +30,14 @@ pub fn unlock() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Unlock)
 }
 
+pub fn unlock_with_user_key(
+    key: [u8; rbw::locked::KEYS_LEN],
+) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockWithUserKey {
+        key: rbw::protocol::UserKeyMaterial::new(key),
+    })
+}
+
 pub fn unlock_with_device() -> anyhow::Result<()> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(

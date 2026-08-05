@@ -138,6 +138,15 @@ async fn handle_request(
             crate::actions::unlock(sock, state.clone(), &environment).await?;
             true
         }
+        rbw::protocol::Action::UnlockWithUserKey { key } => {
+            crate::actions::unlock_with_user_key(
+                sock,
+                state.clone(),
+                key.as_bytes(),
+            )
+            .await?;
+            true
+        }
         rbw::protocol::Action::UnlockWithDevice => {
             Box::pin(crate::actions::unlock_with_device(
                 sock,

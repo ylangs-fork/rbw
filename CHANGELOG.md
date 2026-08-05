@@ -9,6 +9,18 @@
   selected by list number or request ID; the ID can be omitted when only one
   request is pending.
 
+## Added
+
+* Added an optional `unlock_helper` configuration field. When set, the
+  configured command is invoked (with an empty environment, no stdin, and a
+  30-second timeout) during `rbw unlock` before pinentry is consulted. The
+  helper must print `OK <hex>` (optionally followed by a newline) where
+  `<hex>` decodes to exactly 64 bytes. Any failure (spawn error, non-zero
+  exit, timeout, malformed output, wrong length) prints one short generic
+  message to stderr and falls back to the pinentry-based unlock. Configure
+  with `rbw config set unlock_helper <cmd>`, clear with
+  `rbw config unset unlock_helper` or `rbw config set unlock_helper ""`.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
