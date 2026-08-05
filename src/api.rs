@@ -1,6 +1,6 @@
 // serde_repr generates some as conversions that we can't seem to silence from
 // here, unfortunately
-#![allow(clippy::as_conversions)]
+#![allow(clippy::as_conversions, clippy::collapsible_match)]
 
 use crate::prelude::*;
 
@@ -2068,6 +2068,7 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
         "" => {
             // bitwarden_rs returns an empty error and error_description for
             // this case, for some reason
+            #[allow(clippy::collapsible_if)]
             if error_desc.is_none() || error_desc == Some("") {
                 if let Some(error_model) = error_res.error_model.as_ref() {
                     let message = error_model.message.as_str().to_string();

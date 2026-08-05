@@ -361,7 +361,8 @@ async fn login_success(
     match res {
         Ok((keys, org_keys)) => {
             let mut state = state.lock().await;
-            state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
+            state.priv_key =
+                Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
             state.org_keys = Some(org_keys);
         }
         Err(e) => return Err(e).context("failed to unlock database"),

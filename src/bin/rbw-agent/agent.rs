@@ -223,7 +223,7 @@ async fn handle_request(
         rbw::protocol::Action::Version => {
             crate::actions::version(sock).await?;
         }
-    };
+    }
 
     let mut state = state.lock().await;
     state.set_last_environment(environment);

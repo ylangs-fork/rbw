@@ -44,7 +44,7 @@ impl State {
         self.priv_key.is_some() && self.org_keys.is_some()
     }
 
-    /// Clone the user/org key material out of ShatteredKeys for callers that
+    /// Clone the user/org key material out of `ShatteredKeys` for callers that
     /// need to hold the plaintext across multiple operations (e.g. decrypt
     /// with reprompt). The clone is short-lived on the caller's stack; this
     /// relaxes the strict closure confinement of `with_key` for legacy
@@ -56,16 +56,25 @@ impl State {
         if !self.l1_alive() {
             return None;
         }
-        if let Some(id) = org_id {
-            self.org_keys.as_ref().and_then(|keys| keys.get(id)).cloned()
-        } else {
-            self.priv_key.as_ref().map(|keys| keys.with_unsealed(|k| k.clone()))
-        }
+        org_id.map_or_else(
+            || {
+                self.priv_key
+                    .as_ref()
+                    .map(|keys| keys.with_unsealed(std::clone::Clone::clone))
+            },
+            |id| {
+                self.org_keys
+                    .as_ref()
+                    .and_then(|keys| keys.get(id))
+                    .cloned()
+            },
+        )
     }
 
     /// Access the user/org key material inside a closure so the plaintext
-    /// only exists transiently (ShatteredKeys). Gated by L1 liveness: returns
+    /// only exists transiently (`ShatteredKeys`). Gated by L1 liveness: returns
     /// None when the L1 session has expired (caller must re-unlock).
+    #[allow(dead_code)]
     pub fn with_key<R>(
         &self,
         org_id: Option<&str>,
@@ -122,6 +131,7 @@ impl State {
 
     /// A cold unlock is a stronger authorization event than a bio heartbeat
     /// and starts the same L1 lifetime.
+    #[allow(dead_code)]
     pub fn begin_l1_session(&mut self) {
         self.record_bio_success();
     }
