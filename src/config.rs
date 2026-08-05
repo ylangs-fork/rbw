@@ -14,6 +14,8 @@ pub struct Config {
     pub notifications_url: Option<String>,
     #[serde(default = "default_lock_timeout")]
     pub lock_timeout: u64,
+    #[serde(default = "default_l1_timeout")]
+    pub l1_timeout: u64,
     #[serde(default = "default_sync_interval")]
     pub sync_interval: u64,
     #[serde(default = "default_pinentry")]
@@ -36,6 +38,7 @@ impl Default for Config {
             ui_url: None,
             notifications_url: None,
             lock_timeout: default_lock_timeout(),
+            l1_timeout: default_l1_timeout(),
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
             unlock_helper: None,
@@ -49,12 +52,27 @@ pub fn default_lock_timeout() -> u64 {
     3600
 }
 
+pub fn default_l1_timeout() -> u64 {
+    24 * 60 * 60
+}
+
 pub fn default_sync_interval() -> u64 {
     3600
 }
 
 pub fn default_pinentry() -> String {
     "pinentry".to_string()
+}
+
+fn normalize_timeouts(config: &mut Config) {
+    if config.lock_timeout == 0 {
+        log::warn!("lock_timeout must be greater than 0");
+        config.lock_timeout = default_lock_timeout();
+    }
+    if config.l1_timeout == 0 {
+        log::warn!("l1_timeout must be greater than 0");
+        config.l1_timeout = default_l1_timeout();
+    }
 }
 
 impl Config {
@@ -78,10 +96,7 @@ impl Config {
             })?;
         let mut slf: Self = serde_json::from_str(&json)
             .map_err(|source| Error::LoadConfigJson { source, file })?;
-        if slf.lock_timeout == 0 {
-            log::warn!("lock_timeout must be greater than 0");
-            slf.lock_timeout = default_lock_timeout();
-        }
+        normalize_timeouts(&mut slf);
         Ok(slf)
     }
 
@@ -103,10 +118,7 @@ impl Config {
         })?;
         let mut slf: Self = serde_json::from_str(&json)
             .map_err(|source| Error::LoadConfigJson { source, file })?;
-        if slf.lock_timeout == 0 {
-            log::warn!("lock_timeout must be greater than 0");
-            slf.lock_timeout = default_lock_timeout();
-        }
+        normalize_timeouts(&mut slf);
         Ok(slf)
     }
 
@@ -280,5 +292,36 @@ pub async fn registered_device_id(config: &Config) -> Result<String> {
                 .ok_or(Error::KnownDeviceRequired)
         }
         Err(source) => Err(Error::LoadDeviceId { source, file }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l1_timeout_defaults_to_twenty_four_hours() {
+        assert_eq!(default_l1_timeout(), 24 * 60 * 60);
+        assert_eq!(Config::default().l1_timeout, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn missing_l1_timeout_is_backward_compatible() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("l1_timeout");
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.l1_timeout, default_l1_timeout());
+    }
+
+    #[test]
+    fn zero_timeouts_are_normalized() {
+        let mut config = Config {
+            lock_timeout: 0,
+            l1_timeout: 0,
+            ..Config::default()
+        };
+        normalize_timeouts(&mut config);
+        assert_eq!(config.lock_timeout, default_lock_timeout());
+        assert_eq!(config.l1_timeout, default_l1_timeout());
     }
 }

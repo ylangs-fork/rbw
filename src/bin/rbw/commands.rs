@@ -1262,6 +1262,16 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 config.lock_timeout = timeout;
             }
         }
+        "l1_timeout" => {
+            let timeout = value
+                .parse()
+                .context("failed to parse value for l1_timeout")?;
+            if timeout == 0 {
+                log::error!("l1_timeout must be greater than 0");
+            } else {
+                config.l1_timeout = timeout;
+            }
+        }
         "sync_interval" => {
             let interval = value
                 .parse()
@@ -1303,6 +1313,9 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         "client_cert_path" => config.client_cert_path = None,
         "lock_timeout" => {
             config.lock_timeout = rbw::config::default_lock_timeout();
+        }
+        "l1_timeout" => {
+            config.l1_timeout = rbw::config::default_l1_timeout();
         }
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
         "unlock_helper" => config.unlock_helper = None,
@@ -1647,8 +1660,7 @@ pub fn unlocked() -> anyhow::Result<()> {
 }
 
 pub fn sync() -> anyhow::Result<()> {
-    ensure_agent()?;
-    crate::actions::login()?;
+    unlock()?;
     crate::actions::sync()?;
 
     Ok(())

@@ -239,7 +239,11 @@ impl serde::Serialize for UserKeyMaterial {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&crate::base64::encode(&self.0))
+        // Keep the User Key borrowed here: passing the array by value would
+        // create an avoidable plaintext key copy on the stack.
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        let encoded = crate::base64::encode(&self.0);
+        serializer.serialize_str(&encoded)
     }
 }
 
@@ -354,7 +358,7 @@ mod tests {
         }
         assert!(serde_json::from_value::<Action>(serde_json::json!({
             "type": "UnlockWithUserKey",
-            "key": crate::base64::encode(&[0_u8; 63]),
+            "key": crate::base64::encode([0_u8; 63]),
         }))
         .is_err());
     }

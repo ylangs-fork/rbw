@@ -21,6 +21,14 @@
   with `rbw config set unlock_helper <cmd>`, clear with
   `rbw config unset unlock_helper` or `rbw config set unlock_helper ""`.
 
+## Changed
+
+* Replaced request-driven key timeout renewal with explicit L1 sessions.
+  Local agents require fresh dedicated-PAM authorization for secret reads and
+  renew `l1_timeout` only after successful authorization. Agents started
+  without a secure PAM policy use a non-renewable session capped at ten
+  minutes.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added

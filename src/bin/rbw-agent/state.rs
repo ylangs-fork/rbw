@@ -1,12 +1,20 @@
 use sha2::Digest as _;
 
+pub const REMOTE_L1_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 pub struct State {
     pub priv_key: Option<rbw::locked::Keys>,
     pub org_keys:
         Option<std::collections::HashMap<String, rbw::locked::Keys>>,
     pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
     pub timeout: crate::timeout::Timeout,
-    pub timeout_duration: std::time::Duration,
+    pub l1_timeout: std::time::Duration,
+    pub last_bio_success: Option<std::time::Instant>,
+    /// Fixed at agent startup. Once a secure local PAM policy selects the
+    /// local mode, a later policy error must fail closed instead of silently
+    /// downgrading the running session to the remote bypass mode.
+    pub(crate) pam_gate_required: bool,
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
@@ -30,18 +38,54 @@ pub struct State {
 }
 
 impl State {
+    fn has_keys(&self) -> bool {
+        self.priv_key.is_some() && self.org_keys.is_some()
+    }
+
     pub fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
-        org_id.map_or(self.priv_key.as_ref(), |id| {
-            self.org_keys.as_ref().and_then(|h| h.get(id))
-        })
+        self.l1_alive().then(|| {
+            org_id.map_or(self.priv_key.as_ref(), |id| {
+                self.org_keys.as_ref().and_then(|h| h.get(id))
+            })
+        })?
     }
 
     pub fn needs_unlock(&self) -> bool {
-        self.priv_key.is_none() || self.org_keys.is_none()
+        !self.l1_alive()
     }
 
-    pub fn set_timeout(&self) {
-        self.timeout.set(self.timeout_duration);
+    pub fn l1_alive(&self) -> bool {
+        self.has_keys()
+            && self
+                .last_bio_success
+                .is_some_and(|last| last.elapsed() < self.l1_timeout)
+    }
+
+    pub fn pam_gate_required(&self) -> bool {
+        self.pam_gate_required
+    }
+
+    pub fn effective_l1_timeout(
+        configured: std::time::Duration,
+        pam_gate_required: bool,
+    ) -> std::time::Duration {
+        if pam_gate_required {
+            configured
+        } else {
+            configured.min(REMOTE_L1_TIMEOUT)
+        }
+    }
+
+    /// Begin or renew the L1 lifetime after a trusted authorization event.
+    pub fn record_bio_success(&mut self) {
+        self.last_bio_success = Some(std::time::Instant::now());
+        self.timeout.set(self.l1_timeout);
+    }
+
+    /// A cold unlock is a stronger authorization event than a bio heartbeat
+    /// and starts the same L1 lifetime.
+    pub fn begin_l1_session(&mut self) {
+        self.record_bio_success();
     }
 
     pub fn cancellation(&self) -> Cancellation {
@@ -54,6 +98,7 @@ impl State {
         self.priv_key = None;
         self.org_keys = None;
         self.timeout.clear();
+        self.last_bio_success = None;
         let next = self.clear_generation.borrow().wrapping_add(1);
         self.clear_generation.send_replace(next);
     }
@@ -188,7 +233,9 @@ mod tests {
             org_keys: Some(std::collections::HashMap::new()),
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
-            timeout_duration: std::time::Duration::from_secs(60),
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: true,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -200,11 +247,87 @@ mod tests {
         };
         let mut cancellation = state.cancellation();
         assert!(!state.needs_unlock());
+        assert!(state.l1_alive());
         state.clear();
         assert!(state.needs_unlock());
+        assert!(!state.l1_alive());
+        assert!(state.last_bio_success.is_none());
         assert!(state.priv_key.is_none());
         assert!(state.org_keys.is_none());
         assert!(cancellation.is_cancelled());
         cancellation.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn l1_expiry_and_bio_renewal_are_explicit() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: Some(keys()),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(61))
+                    .expect("a 61-second subtraction is representable"),
+            ),
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        assert!(!state.l1_alive());
+        assert!(state.needs_unlock());
+        assert!(state.key(None).is_none());
+        state.record_bio_success();
+        assert!(state.l1_alive());
+        assert!(!state.needs_unlock());
+        assert!(state.key(None).is_some());
+    }
+
+    #[test]
+    fn local_and_remote_modes_choose_distinct_l1_lifetimes() {
+        let configured = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(State::effective_l1_timeout(configured, true), configured);
+        assert_eq!(
+            State::effective_l1_timeout(configured, false),
+            REMOTE_L1_TIMEOUT
+        );
+
+        let stricter = std::time::Duration::from_secs(5 * 60);
+        assert_eq!(State::effective_l1_timeout(stricter, false), stricter);
+    }
+
+    #[tokio::test]
+    async fn pam_gate_mode_is_fixed_for_the_session() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let state = State {
+            priv_key: Some(keys()),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: false,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        assert!(!state.pam_gate_required());
     }
 }

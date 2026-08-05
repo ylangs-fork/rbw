@@ -90,9 +90,14 @@ configuration options:
 * `notifications_url`: The URL of the Bitwarden notifications server to use.
   If unset, will use the `/notifications` path on the configured `base_url`,
   or `https://notifications.bitwarden.com/` if no `base_url` is set.
-* `lock_timeout`: The number of seconds to keep the master keys in memory for
-  before requiring the password to be entered again. Defaults to `3600` (one
-  hour).
+* `lock_timeout`: Legacy setting retained for configuration compatibility. The
+  L0/L1 session lifetime is governed by `l1_timeout`.
+* `l1_timeout`: The maximum number of seconds that an unlocked L1 session can
+  keep User Key material in the agent. Defaults to `86400` (24 hours). On a
+  machine without a secure `/etc/pam.d/rbw-device-auth` policy at agent
+  startup, the effective lifetime is capped at 600 seconds and is never
+  renewed by ordinary requests. On a machine with that policy, each successful
+  PAM authorization renews the configured lifetime.
 * `sync_interval`: `rbw` will automatically sync the database from the server
   at an interval of this many seconds, while the agent is running. Setting
   this value to `0` disables this behavior. Defaults to `3600` (one hour).
@@ -111,6 +116,26 @@ configuration options:
   `rbw config unset unlock_helper` or by passing an empty value:
   `rbw config set unlock_helper ""`.
 
+### Local authorization sessions
+
+After a successful Master Password, device, or `unlock_helper` unlock, the
+agent enters an L1 session. Ordinary requests never extend this session. When a
+secure dedicated policy exists at `/etc/pam.d/rbw-device-auth` when the agent
+starts, secret reads and explicit syncs require a fresh PAM authorization; a
+successful authorization both permits that action and renews `l1_timeout`.
+This makes PAM a user-presence gate, not a source of key material.
+
+If no secure policy exists when the agent starts, it selects remote mode for
+that process: the general secret-access gate is bypassed, the effective L1
+lifetime is capped at ten minutes, and no request can renew it. The mode is
+fixed until the agent restarts. If a local-mode policy is later removed or
+becomes insecure, access fails closed rather than silently downgrading to
+remote mode.
+
+When L1 expires, `rbw lock` is run, or the agent exits, the in-memory User Key
+and organization keys are cleared. Configuration changes take effect after the
+agent is restarted (for example with `rbw stop-agent`).
+
 ### Profiles
 
 `rbw` supports different configuration profiles, which can be switched
@@ -123,10 +148,9 @@ configuration, local vault, and agent.
 
 Commands can generally be used directly, and will handle logging in or
 unlocking as necessary. For instance, running `rbw ls` will run `rbw unlock` to
-unlock the password database before generating the list of entries (but will
-not attempt to log in to the server), `rbw sync` will automatically run `rbw
-login` to log in to the server before downloading the password database (but
-will not unlock the database), and `rbw add` will do both.
+unlock the password database before generating the list of entries, `rbw sync`
+will log in and establish an L1 session before downloading the password database,
+and `rbw add` will do both.
 
 Logging into the server and unlocking the database will only be done as
 necessary, so running `rbw login` when you are already logged in will do

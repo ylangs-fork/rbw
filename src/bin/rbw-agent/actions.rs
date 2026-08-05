@@ -789,6 +789,7 @@ pub async fn unlock_with_device(
         ensure_not_cancelled(&cancellation)?;
         state.priv_key = Some(key);
         state.org_keys = Some(org_keys);
+        state.begin_l1_session();
     }
     respond_ack(sock).await
 }
@@ -887,6 +888,17 @@ pub async fn approve_auth_request(
         ),
     )
     .await??;
+    {
+        let mut state = state.lock().await;
+        ensure_not_cancelled(&cancellation)?;
+        if !state.l1_alive() {
+            state.clear();
+            return Err(anyhow::anyhow!(
+                "agent locked during local system authentication"
+            ));
+        }
+        state.record_bio_success();
+    }
     let encrypted_user_key = {
         let state = state.lock().await;
         encrypt_approval_user_key(&state, &cancellation, &request.public_key)?
@@ -1064,6 +1076,7 @@ async fn unlock_success(
     let mut state = state.lock().await;
     state.priv_key = Some(keys);
     state.org_keys = Some(org_keys);
+    state.begin_l1_session();
     Ok(())
 }
 
@@ -1443,7 +1456,6 @@ pub async fn get_ssh_public_keys(
 ) -> anyhow::Result<Vec<String>> {
     let environment = {
         let state = state.lock().await;
-        state.set_timeout();
         state.last_environment().clone()
     };
     unlock_state(state.clone(), &environment).await?;
@@ -1479,7 +1491,6 @@ pub async fn find_ssh_private_key(
 ) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
     let environment = {
         let state = state.lock().await;
-        state.set_timeout();
         state.last_environment().clone()
     };
     unlock_state(state.clone(), &environment).await?;
@@ -1562,7 +1573,9 @@ mod device_auth_tests {
             org_keys,
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
-            timeout_duration: std::time::Duration::from_secs(60),
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: unlocked.then(std::time::Instant::now),
+            pam_gate_required: true,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),

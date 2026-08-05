@@ -125,18 +125,18 @@ async fn handle_request(
         }
     };
     let (action, environment) = req.into_parts();
-    let set_timeout = match &action {
+    if sensitive_action(&action) {
+        gate_sensitive_action(state.clone(), &environment).await?;
+    }
+    match &action {
         rbw::protocol::Action::Register => {
             crate::actions::register(sock, &environment).await?;
-            true
         }
         rbw::protocol::Action::Login => {
             crate::actions::login(sock, state.clone(), &environment).await?;
-            true
         }
         rbw::protocol::Action::Unlock => {
             crate::actions::unlock(sock, state.clone(), &environment).await?;
-            true
         }
         rbw::protocol::Action::UnlockWithUserKey { key } => {
             crate::actions::unlock_with_user_key(
@@ -145,7 +145,6 @@ async fn handle_request(
                 key.as_bytes(),
             )
             .await?;
-            true
         }
         rbw::protocol::Action::UnlockWithDevice => {
             Box::pin(crate::actions::unlock_with_device(
@@ -154,11 +153,9 @@ async fn handle_request(
                 &environment,
             ))
             .await?;
-            true
         }
         rbw::protocol::Action::ListAuthRequests => {
             crate::actions::list_auth_requests(sock).await?;
-            false
         }
         rbw::protocol::Action::ApproveAuthRequest { id } => {
             crate::actions::approve_auth_request(
@@ -168,23 +165,18 @@ async fn handle_request(
                 &environment,
             )
             .await?;
-            true
         }
         rbw::protocol::Action::RejectAuthRequest { id } => {
             crate::actions::reject_auth_request(sock, id).await?;
-            false
         }
         rbw::protocol::Action::CheckLock => {
             crate::actions::check_lock(sock, state.clone()).await?;
-            false
         }
         rbw::protocol::Action::Lock => {
             crate::actions::lock(sock, state.clone()).await?;
-            false
         }
         rbw::protocol::Action::Sync => {
             crate::actions::sync(Some(sock), state.clone()).await?;
-            false
         }
         rbw::protocol::Action::Decrypt {
             cipherstring,
@@ -203,7 +195,6 @@ async fn handle_request(
                 org_id.as_deref(),
             )
             .await?;
-            true
         }
         rbw::protocol::Action::Encrypt { plaintext, org_id } => {
             crate::actions::encrypt(
@@ -213,25 +204,89 @@ async fn handle_request(
                 org_id.as_deref(),
             )
             .await?;
-            true
         }
         rbw::protocol::Action::ClipboardStore { text } => {
             crate::actions::clipboard_store(sock, state.clone(), text)
                 .await?;
-            true
         }
         rbw::protocol::Action::Quit => std::process::exit(0),
         rbw::protocol::Action::Version => {
             crate::actions::version(sock).await?;
-            false
         }
     };
 
     let mut state = state.lock().await;
     state.set_last_environment(environment);
-    if set_timeout {
-        state.set_timeout();
-    }
 
     Ok(())
+}
+
+fn sensitive_action(action: &rbw::protocol::Action) -> bool {
+    matches!(
+        action,
+        rbw::protocol::Action::Sync | rbw::protocol::Action::Decrypt { .. }
+    )
+}
+
+pub async fn gate_sensitive_action(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let pam_gate_required = {
+        let mut state = state.lock().await;
+        if !state.l1_alive() {
+            state.clear();
+            return Err(anyhow::anyhow!("agent is locked"));
+        }
+        state.pam_gate_required()
+    };
+
+    if !pam_gate_required {
+        return Ok(());
+    }
+
+    // The mode was selected at startup. Revalidate the policy for every
+    // authorization and fail closed if the local policy disappears or becomes
+    // insecure instead of dynamically downgrading to the remote bypass mode.
+    rbw::pam_gate::PamGate::new()?
+        .with_context(
+            environment.clone(),
+            "Authorize rbw secret access",
+            "Confirm that you are present to access rbw secrets",
+        )?
+        .authorize()
+        .await?;
+
+    let mut state = state.lock().await;
+    if !state.l1_alive() {
+        state.clear();
+        return Err(anyhow::anyhow!(
+            "agent locked during local authentication"
+        ));
+    }
+    state.record_bio_success();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_secret_read_actions_require_the_general_gate() {
+        assert!(sensitive_action(&rbw::protocol::Action::Sync));
+        assert!(sensitive_action(&rbw::protocol::Action::Decrypt {
+            cipherstring: "cipher".to_string(),
+            entry_key: None,
+            org_id: None,
+        }));
+        assert!(!sensitive_action(&rbw::protocol::Action::Encrypt {
+            plaintext: "secret".to_string(),
+            org_id: None,
+        }));
+        assert!(!sensitive_action(&rbw::protocol::Action::ClipboardStore {
+            text: "secret".to_string(),
+        }));
+        assert!(!sensitive_action(&rbw::protocol::Action::Unlock));
+    }
 }
