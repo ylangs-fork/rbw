@@ -5,6 +5,7 @@ mod agent;
 mod daemon;
 mod debugger;
 mod local_auth;
+mod memory_guard;
 mod notifications;
 mod sock;
 mod ssh_agent;
@@ -13,6 +14,8 @@ mod timeout;
 
 async fn tokio_main(
     startup_ack: Option<crate::daemon::StartupAck>,
+    memory_guard: crate::memory_guard::MemoryGuard,
+    sentinel_exit: Option<std::sync::mpsc::Receiver<()>>,
 ) -> anyhow::Result<()> {
     let listener = crate::sock::listen()?;
 
@@ -52,8 +55,13 @@ async fn tokio_main(
                 .ok(),
         }));
 
-    let agent =
-        crate::agent::Agent::new(timer_r, sync_timer_r, state.clone());
+    memory_guard.spawn_watchdogs(state.clone(), sentinel_exit);
+    let agent = crate::agent::Agent::new(
+        timer_r,
+        sync_timer_r,
+        state.clone(),
+        memory_guard,
+    );
 
     let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
 
@@ -77,6 +85,18 @@ fn real_main() -> anyhow::Result<()> {
     let startup_ack =
         daemon::daemonize(no_daemonize).context("failed to daemonize")?;
 
+    let (memory_guard, sentinel_exit) =
+        match crate::memory_guard::start_sentinel() {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::warn!(
+                    "failed to start ptrace sentinel; continuing with \
+                     TracerPid monitoring only: {error:#}"
+                );
+                (crate::memory_guard::MemoryGuard::default(), None)
+            }
+        };
+
     if let Err(e) = debugger::disable_tracing() {
         log::warn!("{e}");
     }
@@ -87,7 +107,9 @@ fn real_main() -> anyhow::Result<()> {
     // unwrap is fine here because there's no good reason that this should
     // ever fail
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        if let Err(e) = tokio_main(startup_ack).await {
+        if let Err(e) =
+            tokio_main(startup_ack, memory_guard, sentinel_exit).await
+        {
             // this unwrap is fine because it's the only real option here
             w.send(e).unwrap();
         }
@@ -101,6 +123,9 @@ fn real_main() -> anyhow::Result<()> {
 }
 
 fn main() {
+    if crate::memory_guard::sentinel_requested() {
+        std::process::exit(i32::from(!crate::memory_guard::run_sentinel()));
+    }
     if crate::local_auth::helper_requested() {
         std::process::exit(i32::from(!crate::local_auth::run_helper()));
     }
