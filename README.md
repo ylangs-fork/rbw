@@ -247,20 +247,81 @@ recall an approval the server accepted just before cancellation. Closing the
 requester CLI after it prints the metadata does not proactively cancel the agent
 task; explicitly lock the agent or let the five-minute request deadline expire.
 
-### SSH Agent
+### rbw SSH agent
 
-`rbw-agent` includes a built-in SSH agent for signing SSH authentication
-challenges directly. To use it, ensure that rbw is running (in order to make
-it start handling ssh agent requests), and then point your SSH client to the
-SSH agent socket:
+The rbw SSH agent is a **local Unix-socket service and does not make network
+connections**. It exposes the read-only `ssh-agent` protocol so OpenSSH, Git,
+and compatible tools can use SSH private keys stored in the vault without
+writing those keys to `~/.ssh`.
+
+The service is opt-in. Enable it, start/unlock rbw, and point clients at its
+socket:
 
 ```sh
+rbw config set ssh_agent.enabled true
 rbw unlock
-export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent-socket"
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw/ssh-agent.sock"
+ssh-add -L
+ssh user@example.net
+git push
 ```
 
-If you're using a profile, the socket will be located at
-`"XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent-socket"`.
+For profiles, the socket is
+`$XDG_RUNTIME_DIR/rbw-<profile>/ssh-agent.sock`. The runtime directory is mode
+`0700` and the socket is mode `0600`. The agent only supports listing identities
+and signing; requests to add, remove, lock, or otherwise mutate keys fail.
+Bitwarden SSH-key items are discovered automatically. A secure note is also
+usable when its notes field consists of an unencrypted OpenSSH private-key PEM.
+(The note remains encrypted in the vault; "unencrypted" here means that the PEM
+itself has no second passphrase.)
+
+Signing policy is configured globally and can be overridden by OpenSSH SHA256
+fingerprint:
+
+```sh
+rbw config set ssh_agent.default_policy l1
+rbw config set 'ssh_agent.policy.SHA256:BASE64_FINGERPRINT' always
+```
+
+Policies are:
+
+* `always`: require a fresh local PAM authorization for every signature. If the
+  PAM gate is unavailable, signing fails closed. Remote approval for this case
+  is a separate integration phase.
+* `l1` (default): allow while the rbw agent is already unlocked; otherwise
+  require PAM and fail closed if it is unavailable.
+* `never`: do not add an authorization gate beyond access to the unlocked rbw
+  agent.
+
+The PAM service is `/etc/pam.d/rbw-device-auth`; its root-owned policy can use
+`pam_fprintd`, Howdy, a password module, or another administrator-selected PAM
+module.
+
+#### sudo with the rbw SSH agent
+
+`sudo` can use the same agent through the distribution-provided
+`pam_ssh_agent_auth` module while retaining the normal password path as a
+fallback:
+
+1. Install `pam_ssh_agent_auth` using the distribution package manager.
+2. Add the following before the existing password/common-auth rule in
+   `/etc/pam.d/sudo` (the exact include layout is distribution-specific):
+
+   ```pam
+   auth sufficient pam_ssh_agent_auth.so file=~/.ssh/authorized_keys
+   auth required   pam_unix.so
+   ```
+
+   If the distribution already includes `pam_unix` indirectly, keep that
+   existing include instead of adding a duplicate. Keep an independent root
+   shell open while testing PAM changes.
+3. Put the public key printed by `ssh-add -L` in the invoking user's
+   `~/.ssh/authorized_keys` (or the file selected above).
+4. Preserve `SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/rbw/ssh-agent.sock` for sudo as
+   required by the distribution's sudo environment policy.
+
+If rbw is stopped, locked, or rejects signing, `pam_ssh_agent_auth` does not
+succeed and the retained password rule prompts normally.
 
 ### 2FA support
 

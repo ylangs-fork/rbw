@@ -4,7 +4,7 @@ use std::io::{Read as _, Write as _};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Config {
     pub email: Option<String>,
     pub sso_id: Option<String>,
@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock_helper: Option<String>,
     pub client_cert_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub ssh_agent: SshAgentConfig,
     // backcompat, no longer generated in new configs
     #[serde(skip_serializing)]
     pub device_id: Option<String>,
@@ -43,6 +45,7 @@ impl Default for Config {
             pinentry: default_pinentry(),
             unlock_helper: None,
             client_cert_path: None,
+            ssh_agent: SshAgentConfig::default(),
             device_id: None,
         }
     }
@@ -72,6 +75,59 @@ fn normalize_timeouts(config: &mut Config) {
     if config.l1_timeout == 0 {
         log::warn!("l1_timeout must be greater than 0");
         config.l1_timeout = default_l1_timeout();
+    }
+}
+
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Eq,
+    PartialEq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAgentPolicy {
+    Always,
+    #[default]
+    L1,
+    Never,
+}
+
+impl std::str::FromStr for SshAgentPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "always" => Ok(Self::Always),
+            "l1" => Ok(Self::L1),
+            "never" => Ok(Self::Never),
+            _ => Err(anyhow::anyhow!(
+                "invalid SSH agent policy {value:?}; expected always, l1, or never"
+            )),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct SshAgentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_policy: SshAgentPolicy,
+    /// Optional policy overrides indexed by an OpenSSH SHA256 fingerprint.
+    #[serde(default)]
+    pub policies: std::collections::BTreeMap<String, SshAgentPolicy>,
+}
+
+impl SshAgentConfig {
+    pub fn policy_for(&self, fingerprint: &str) -> SshAgentPolicy {
+        self.policies
+            .get(fingerprint)
+            .copied()
+            .unwrap_or(self.default_policy)
     }
 }
 
@@ -323,5 +379,35 @@ mod tests {
         normalize_timeouts(&mut config);
         assert_eq!(config.lock_timeout, default_lock_timeout());
         assert_eq!(config.l1_timeout, default_l1_timeout());
+    }
+
+    #[test]
+    fn ssh_agent_is_opt_in_and_defaults_to_l1() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.ssh_agent.enabled);
+        assert_eq!(config.ssh_agent.default_policy, SshAgentPolicy::L1);
+    }
+
+    #[test]
+    fn fingerprint_policy_overrides_default() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "ssh_agent": {
+                    "enabled": true,
+                    "default_policy": "l1",
+                    "policies": {"SHA256:test": "always"}
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(config.ssh_agent.enabled);
+        assert_eq!(
+            config.ssh_agent.policy_for("SHA256:test"),
+            SshAgentPolicy::Always
+        );
+        assert_eq!(
+            config.ssh_agent.policy_for("SHA256:other"),
+            SshAgentPolicy::L1
+        );
     }
 }

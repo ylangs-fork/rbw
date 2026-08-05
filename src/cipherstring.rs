@@ -153,6 +153,14 @@ impl CipherString {
         &self,
         keys: &crate::locked::Keys,
     ) -> Result<crate::locked::Vec> {
+        self.decrypt_locked_symmetric_with_entry_key(keys, None)
+    }
+
+    pub fn decrypt_locked_symmetric_with_entry_key(
+        &self,
+        keys: &crate::locked::Keys,
+        entry_key: Option<&crate::locked::Keys>,
+    ) -> Result<crate::locked::Vec> {
         if let Self::Symmetric {
             iv,
             ciphertext,
@@ -162,7 +170,7 @@ impl CipherString {
             let mut res = crate::locked::Vec::new();
             res.extend(ciphertext.iter().copied());
             let cipher = decrypt_common_symmetric(
-                keys,
+                entry_key.unwrap_or(keys),
                 iv,
                 ciphertext,
                 mac.as_deref(),
@@ -325,6 +333,32 @@ fn locked_symmetric_decryption_truncates_pkcs7_padding() {
         .expect("decryption succeeds");
     assert_eq!(decrypted.data(), plaintext);
     assert_eq!(decrypted.data().len(), crate::locked::KEYS_LEN);
+}
+
+#[test]
+fn locked_symmetric_decryption_uses_entry_key() {
+    let mut account_material = crate::locked::Vec::new();
+    account_material.extend(0_u8..64);
+    let account_keys = crate::locked::Keys::new(account_material);
+    let mut entry_material = crate::locked::Vec::new();
+    entry_material.extend(64_u8..128);
+    let entry_keys = crate::locked::Keys::new(entry_material);
+    let plaintext = b"per-item encrypted SSH private key";
+    let cipherstring =
+        CipherString::encrypt_symmetric(&entry_keys, plaintext)
+            .expect("encryption succeeds");
+
+    let decrypted = cipherstring
+        .decrypt_locked_symmetric_with_entry_key(
+            &account_keys,
+            Some(&entry_keys),
+        )
+        .expect("entry-key decryption succeeds");
+    assert_eq!(decrypted.data(), plaintext);
+    assert!(matches!(
+        cipherstring.decrypt_locked_symmetric(&account_keys),
+        Err(Error::InvalidMac)
+    ));
 }
 
 #[test]

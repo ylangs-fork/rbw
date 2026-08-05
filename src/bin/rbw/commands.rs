@@ -1286,6 +1286,28 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 config.unlock_helper = Some(value.to_string());
             }
         }
+        "ssh_agent.enabled" => {
+            config.ssh_agent.enabled = value
+                .parse()
+                .context("failed to parse value for ssh_agent.enabled")?;
+        }
+        "ssh_agent.default_policy" => {
+            config.ssh_agent.default_policy = value.parse()?;
+        }
+        key if key.starts_with("ssh_agent.policy.") => {
+            let fingerprint = key
+                .strip_prefix("ssh_agent.policy.")
+                .expect("prefix checked above");
+            if fingerprint.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SSH agent policy fingerprint must not be empty"
+                ));
+            }
+            config
+                .ssh_agent
+                .policies
+                .insert(fingerprint.to_string(), value.parse()?);
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1319,6 +1341,22 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         }
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
         "unlock_helper" => config.unlock_helper = None,
+
+        "ssh_agent.enabled" => config.ssh_agent.enabled = false,
+        "ssh_agent.default_policy" => {
+            config.ssh_agent.default_policy =
+                rbw::config::SshAgentPolicy::default();
+        }
+        key if key.starts_with("ssh_agent.policy.") => {
+            let fingerprint = key
+                .strip_prefix("ssh_agent.policy.")
+                .expect("prefix checked above");
+            if config.ssh_agent.policies.remove(fingerprint).is_none() {
+                return Err(anyhow::anyhow!(
+                    "no SSH agent policy configured for {fingerprint}"
+                ));
+            }
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;

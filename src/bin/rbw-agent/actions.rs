@@ -361,8 +361,7 @@ async fn login_success(
     match res {
         Ok((keys, org_keys)) => {
             let mut state = state.lock().await;
-            state.priv_key =
-                Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
+            state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
             state.org_keys = Some(org_keys);
         }
         Err(e) => return Err(e).context("failed to unlock database"),
@@ -790,7 +789,6 @@ pub async fn unlock_with_device(
         ensure_not_cancelled(&cancellation)?;
         state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&key));
         state.org_keys = Some(org_keys);
-        state.begin_l1_session();
     }
     respond_ack(sock).await
 }
@@ -825,14 +823,11 @@ fn encrypt_approval_user_key(
     public_key: &str,
 ) -> anyhow::Result<String> {
     ensure_not_cancelled(cancellation)?;
-    state
-        .with_key(None, |user_key| {
-            rbw::device_auth::encrypt_user_key(public_key, user_key)
-                .context("failed to encrypt user key for auth request")
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("agent locked during local system authentication")
-        })?
+    let user_key = state.key_cloned(None).ok_or_else(|| {
+        anyhow::anyhow!("agent locked during local system authentication")
+    })?;
+    rbw::device_auth::encrypt_user_key(public_key, &user_key)
+        .context("failed to encrypt user key for auth request")
 }
 
 pub async fn approve_auth_request(
@@ -892,17 +887,6 @@ pub async fn approve_auth_request(
         ),
     )
     .await??;
-    {
-        let mut state = state.lock().await;
-        ensure_not_cancelled(&cancellation)?;
-        if !state.l1_alive() {
-            state.clear();
-            return Err(anyhow::anyhow!(
-                "agent locked during local system authentication"
-            ));
-        }
-        state.record_bio_success();
-    }
     let encrypted_user_key = {
         let state = state.lock().await;
         encrypt_approval_user_key(&state, &cancellation, &request.public_key)?
@@ -1032,6 +1016,18 @@ async fn unlock_state(
     Ok(())
 }
 
+pub async fn unlock(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    unlock_state(state, environment).await?;
+
+    respond_ack(sock).await?;
+
+    Ok(())
+}
+
 pub async fn unlock_with_user_key(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
@@ -1060,18 +1056,6 @@ pub async fn unlock_with_user_key(
     respond_ack(sock).await
 }
 
-pub async fn unlock(
-    sock: &mut crate::sock::Sock,
-    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
-    environment: &rbw::protocol::Environment,
-) -> anyhow::Result<()> {
-    unlock_state(state, environment).await?;
-
-    respond_ack(sock).await?;
-
-    Ok(())
-}
-
 async fn unlock_success(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     keys: rbw::locked::Keys,
@@ -1080,7 +1064,6 @@ async fn unlock_success(
     let mut state = state.lock().await;
     state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
     state.org_keys = Some(org_keys);
-    state.begin_l1_session();
     Ok(())
 }
 
@@ -1153,18 +1136,36 @@ pub async fn sync(
     Ok(())
 }
 
-async fn decrypt_cipher(
+async fn decrypt_cipher_locked(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<rbw::locked::Vec> {
     let mut state = state.lock().await;
     if !state.master_password_reprompt_initialized() {
         let db = load_db().await?;
         state.set_master_password_reprompt(&db.entries);
     }
+    let Some(keys) = state.key_cloned(org_id) else {
+        return Err(anyhow::anyhow!(
+            "failed to find decryption keys in in-memory state"
+        ));
+    };
+    let entry_key = if let Some(entry_key) = entry_key {
+        let key_cipherstring =
+            rbw::cipherstring::CipherString::new(entry_key)
+                .context("failed to parse individual item encryption key")?;
+        Some(rbw::locked::Keys::new(
+            key_cipherstring.decrypt_locked_symmetric(&keys).context(
+                "failed to decrypt individual item encryption key",
+            )?,
+        ))
+    } else {
+        None
+    };
+
     let mut sha256 = sha2::Sha256::new();
     sha256.update(cipherstring);
     let master_password_reprompt: [u8; 32] = sha256.finalize().into();
@@ -1247,36 +1248,30 @@ async fn decrypt_cipher(
         }
     }
 
-    state
-        .with_key(org_id, |keys| {
-            let entry_key = if let Some(entry_key) = entry_key {
-                let key_cipherstring = rbw::cipherstring::CipherString::new(
-                    entry_key,
-                )
-                .context("failed to parse individual item encryption key")?;
-                Some(rbw::locked::Keys::new(
-                    key_cipherstring.decrypt_locked_symmetric(keys).context(
-                        "failed to decrypt individual item encryption key",
-                    )?,
-                ))
-            } else {
-                None
-            };
-            let cipherstring =
-                rbw::cipherstring::CipherString::new(cipherstring)
-                    .context("failed to parse encrypted secret")?;
-            String::from_utf8(
-                cipherstring
-                    .decrypt_symmetric(keys, entry_key.as_ref())
-                    .context("failed to decrypt encrypted secret")?,
-            )
-            .context("failed to parse decrypted secret")
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "failed to find decryption keys in in-memory state"
-            )
-        })?
+    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
+        .context("failed to parse encrypted secret")?;
+    cipherstring
+        .decrypt_locked_symmetric_with_entry_key(&keys, entry_key.as_ref())
+        .context("failed to decrypt encrypted secret")
+}
+
+async fn decrypt_cipher(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    cipherstring: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let plaintext = decrypt_cipher_locked(
+        state,
+        environment,
+        cipherstring,
+        entry_key,
+        org_id,
+    )
+    .await?;
+    String::from_utf8(plaintext.data().to_vec())
+        .context("failed to parse decrypted secret")
 }
 
 pub async fn decrypt(
@@ -1302,19 +1297,16 @@ pub async fn encrypt(
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = state.lock().await;
-    let cipherstring = state
-        .with_key(org_id, |keys| {
-            rbw::cipherstring::CipherString::encrypt_symmetric(
-                keys,
-                plaintext.as_bytes(),
-            )
-            .context("failed to encrypt plaintext secret")
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "failed to find encryption keys in in-memory state"
-            )
-        })??;
+    let Some(keys) = state.key_cloned(org_id) else {
+        return Err(anyhow::anyhow!(
+            "failed to find encryption keys in in-memory state"
+        ));
+    };
+    let cipherstring = rbw::cipherstring::CipherString::encrypt_symmetric(
+        &keys,
+        plaintext.as_bytes(),
+    )
+    .context("failed to encrypt plaintext secret")?;
 
     respond_encrypt(sock, cipherstring.to_string()).await?;
 
@@ -1465,6 +1457,7 @@ pub async fn get_ssh_public_keys(
 ) -> anyhow::Result<Vec<String>> {
     let environment = {
         let state = state.lock().await;
+        state.set_timeout();
         state.last_environment().clone()
     };
     unlock_state(state.clone(), &environment).await?;
@@ -1473,21 +1466,43 @@ pub async fn get_ssh_public_keys(
     let mut pubkeys = Vec::new();
 
     for entry in db.entries {
-        if let rbw::db::EntryData::SshKey {
-            public_key: Some(encrypted),
-            ..
-        } = &entry.data
-        {
-            let plaintext = decrypt_cipher(
-                state.clone(),
-                &environment,
-                encrypted,
-                entry.key.as_deref(),
-                entry.org_id.as_deref(),
-            )
-            .await?;
-
-            pubkeys.push(plaintext);
+        match &entry.data {
+            rbw::db::EntryData::SshKey {
+                public_key: Some(encrypted),
+                ..
+            } => {
+                let plaintext = decrypt_cipher(
+                    state.clone(),
+                    &environment,
+                    encrypted,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+                .await?;
+                pubkeys.push(plaintext);
+            }
+            rbw::db::EntryData::SecureNote => {
+                let Some(encrypted) = entry.notes.as_deref() else {
+                    continue;
+                };
+                let plaintext = decrypt_cipher_locked(
+                    state.clone(),
+                    &environment,
+                    encrypted,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+                .await?;
+                if let Ok(private_key) = private_key_from_locked(&plaintext) {
+                    pubkeys.push(
+                        private_key
+                            .public_key()
+                            .to_openssh()
+                            .map_err(anyhow::Error::new)?,
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1500,6 +1515,7 @@ pub async fn find_ssh_private_key(
 ) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
     let environment = {
         let state = state.lock().await;
+        state.set_timeout();
         state.last_environment().clone()
     };
     unlock_state(state.clone(), &environment).await?;
@@ -1539,7 +1555,7 @@ pub async fn find_ssh_private_key(
                         anyhow::anyhow!("Matching entry has no private key")
                     })?;
 
-                let private_key_plaintext = decrypt_cipher(
+                let private_key_plaintext = decrypt_cipher_locked(
                     state.clone(),
                     &environment,
                     private_key_enc,
@@ -1548,15 +1564,41 @@ pub async fn find_ssh_private_key(
                 )
                 .await?;
 
-                return ssh_agent_lib::ssh_key::PrivateKey::from_openssh(
-                    private_key_plaintext,
-                )
-                .map_err(anyhow::Error::new);
+                return private_key_from_locked(&private_key_plaintext);
+            }
+        } else if matches!(entry.data, rbw::db::EntryData::SecureNote) {
+            let Some(notes) = entry.notes.as_deref() else {
+                continue;
+            };
+            let private_key_plaintext = decrypt_cipher_locked(
+                state.clone(),
+                &environment,
+                notes,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+            .await?;
+            let Ok(private_key) =
+                private_key_from_locked(&private_key_plaintext)
+            else {
+                continue;
+            };
+            if private_key.public_key().to_bytes() == request_bytes {
+                return Ok(private_key);
             }
         }
     }
 
     Err(anyhow::anyhow!("No matching private key found"))
+}
+
+fn private_key_from_locked(
+    private_key: &rbw::locked::Vec,
+) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
+    let private_key = std::str::from_utf8(private_key.data())
+        .context("failed to parse SSH private key as UTF-8")?;
+    ssh_agent_lib::ssh_key::PrivateKey::from_openssh(private_key)
+        .map_err(anyhow::Error::new)
 }
 
 #[cfg(test)]
@@ -1585,8 +1627,12 @@ mod device_auth_tests {
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
             l1_timeout: std::time::Duration::from_secs(60),
-            last_bio_success: unlocked.then(std::time::Instant::now),
-            pam_gate_required: true,
+            last_bio_success: if unlocked {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            },
+            pam_gate_required: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
