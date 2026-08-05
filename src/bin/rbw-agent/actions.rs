@@ -1108,13 +1108,13 @@ pub async fn sync(
     Ok(())
 }
 
-async fn decrypt_cipher(
+async fn decrypt_cipher_locked(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<rbw::locked::Vec> {
     let mut state = state.lock().await;
     if !state.master_password_reprompt_initialized() {
         let db = load_db().await?;
@@ -1222,14 +1222,28 @@ async fn decrypt_cipher(
 
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
-    let plaintext = String::from_utf8(
-        cipherstring
-            .decrypt_symmetric(keys, entry_key.as_ref())
-            .context("failed to decrypt encrypted secret")?,
-    )
-    .context("failed to parse decrypted secret")?;
+    cipherstring
+        .decrypt_locked_symmetric_with_entry_key(keys, entry_key.as_ref())
+        .context("failed to decrypt encrypted secret")
+}
 
-    Ok(plaintext)
+async fn decrypt_cipher(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    cipherstring: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let plaintext = decrypt_cipher_locked(
+        state,
+        environment,
+        cipherstring,
+        entry_key,
+        org_id,
+    )
+    .await?;
+    String::from_utf8(plaintext.data().to_vec())
+        .context("failed to parse decrypted secret")
 }
 
 pub async fn decrypt(
@@ -1424,21 +1438,43 @@ pub async fn get_ssh_public_keys(
     let mut pubkeys = Vec::new();
 
     for entry in db.entries {
-        if let rbw::db::EntryData::SshKey {
-            public_key: Some(encrypted),
-            ..
-        } = &entry.data
-        {
-            let plaintext = decrypt_cipher(
-                state.clone(),
-                &environment,
-                encrypted,
-                entry.key.as_deref(),
-                entry.org_id.as_deref(),
-            )
-            .await?;
-
-            pubkeys.push(plaintext);
+        match &entry.data {
+            rbw::db::EntryData::SshKey {
+                public_key: Some(encrypted),
+                ..
+            } => {
+                let plaintext = decrypt_cipher(
+                    state.clone(),
+                    &environment,
+                    encrypted,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+                .await?;
+                pubkeys.push(plaintext);
+            }
+            rbw::db::EntryData::SecureNote => {
+                let Some(encrypted) = entry.notes.as_deref() else {
+                    continue;
+                };
+                let plaintext = decrypt_cipher_locked(
+                    state.clone(),
+                    &environment,
+                    encrypted,
+                    entry.key.as_deref(),
+                    entry.org_id.as_deref(),
+                )
+                .await?;
+                if let Ok(private_key) = private_key_from_locked(&plaintext) {
+                    pubkeys.push(
+                        private_key
+                            .public_key()
+                            .to_openssh()
+                            .map_err(anyhow::Error::new)?,
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1491,7 +1527,7 @@ pub async fn find_ssh_private_key(
                         anyhow::anyhow!("Matching entry has no private key")
                     })?;
 
-                let private_key_plaintext = decrypt_cipher(
+                let private_key_plaintext = decrypt_cipher_locked(
                     state.clone(),
                     &environment,
                     private_key_enc,
@@ -1500,15 +1536,41 @@ pub async fn find_ssh_private_key(
                 )
                 .await?;
 
-                return ssh_agent_lib::ssh_key::PrivateKey::from_openssh(
-                    private_key_plaintext,
-                )
-                .map_err(anyhow::Error::new);
+                return private_key_from_locked(&private_key_plaintext);
+            }
+        } else if matches!(entry.data, rbw::db::EntryData::SecureNote) {
+            let Some(notes) = entry.notes.as_deref() else {
+                continue;
+            };
+            let private_key_plaintext = decrypt_cipher_locked(
+                state.clone(),
+                &environment,
+                notes,
+                entry.key.as_deref(),
+                entry.org_id.as_deref(),
+            )
+            .await?;
+            let Ok(private_key) =
+                private_key_from_locked(&private_key_plaintext)
+            else {
+                continue;
+            };
+            if private_key.public_key().to_bytes() == request_bytes {
+                return Ok(private_key);
             }
         }
     }
 
     Err(anyhow::anyhow!("No matching private key found"))
+}
+
+fn private_key_from_locked(
+    private_key: &rbw::locked::Vec,
+) -> anyhow::Result<ssh_agent_lib::ssh_key::PrivateKey> {
+    let private_key = std::str::from_utf8(private_key.data())
+        .context("failed to parse SSH private key as UTF-8")?;
+    ssh_agent_lib::ssh_key::PrivateKey::from_openssh(private_key)
+        .map_err(anyhow::Error::new)
 }
 
 #[cfg(test)]

@@ -44,6 +44,19 @@ impl State {
         self.timeout.set(self.timeout_duration);
     }
 
+    // HOOK(state-machine): B2 replaces this unlocked-state approximation
+    // with the L1 expiry calculation from the shared contract.
+    pub fn l1_alive(&self) -> bool {
+        !self.needs_unlock()
+    }
+
+    // HOOK(state-machine): B3 replaces the existing timeout reset with the
+    // dedicated bio-heartbeat timestamp.
+    #[allow(clippy::needless_pass_by_ref_mut)] // &mut is the B3 merge contract
+    pub fn record_bio_success(&mut self) {
+        self.set_timeout();
+    }
+
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
             receiver: self.clear_generation.subscribe(),

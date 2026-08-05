@@ -55,9 +55,14 @@ async fn tokio_main(
     let agent =
         crate::agent::Agent::new(timer_r, sync_timer_r, state.clone());
 
-    let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
-
-    tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    if config.ssh_agent.enabled {
+        let ssh_agent =
+            crate::ssh_agent::SshAgent::new(state.clone(), config.ssh_agent);
+        tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    } else {
+        crate::ssh_agent::remove_stale_socket()?;
+        agent.run(listener).await?;
+    }
 
     Ok(())
 }
