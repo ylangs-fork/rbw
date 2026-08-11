@@ -386,4 +386,58 @@ mod tests {
         };
         assert!(!state.pam_gate_required());
     }
+
+    /// Regression: a cold unlock (master password / TPM helper / device-auth
+    /// approval) installs keys AND must start the L1 session. The real unlock
+    /// paths call `record_bio_success()` after installing keys; without it,
+    /// `needs_unlock()` stays true forever (L1 deadlock) because `l1_alive()`
+    /// requires both keys and a fresh `last_bio_success`. See
+    /// `e2e-real-report.md`.
+    #[tokio::test]
+    async fn cold_unlock_must_start_l1_session() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: None,
+            org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: None,
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        // Pre-unlock: nothing installed, definitely needs unlock.
+        assert!(state.needs_unlock());
+        assert!(!state.l1_alive());
+
+        // Simulate the body of unlock_success(): install keys.
+        state.priv_key =
+            Some(rbw::locked_shatter::ShatteredKeys::seal(&keys()));
+        state.org_keys = Some(std::collections::HashMap::new());
+
+        // Keys present but no bio heartbeat yet: this is the deadlock state
+        // that existed before the fix. l1_alive() must still be false.
+        assert!(!state.l1_alive(),
+            "keys installed without bio heartbeat must NOT be L1-alive (this models the pre-fix deadlock)");
+        assert!(state.needs_unlock(),
+            "keys without heartbeat must still report needs_unlock");
+
+        // The fix: a cold unlock is a full-trust event and records a bio
+        // success, establishing the L1 session.
+        state.record_bio_success();
+        assert!(state.l1_alive(),
+            "after record_bio_success (cold-unlock trust), L1 must be alive");
+        assert!(!state.needs_unlock(),
+            "after cold unlock the agent must NOT report needs_unlock");
+        assert!(state.with_key(None, |_| ()).is_some());
+    }
 }

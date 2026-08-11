@@ -790,6 +790,9 @@ pub async fn unlock_with_device(
         ensure_not_cancelled(&cancellation)?;
         state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&key));
         state.org_keys = Some(org_keys);
+        // Device-auth approval delivered the User Key -> a full-trust event,
+        // start the L1 session just like a cold unlock.
+        state.record_bio_success();
     }
     respond_ack(sock).await
 }
@@ -1065,6 +1068,12 @@ async fn unlock_success(
     let mut state = state.lock().await;
     state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
     state.org_keys = Some(org_keys);
+    // A cold unlock (master password / TPM helper / device-auth approval) is a
+    // full-trust authorization event, stronger than a bio heartbeat, so it
+    // starts the L1 session the same way a successful bio gate does.
+    // Without this, needs_unlock() (= !l1_alive()) stays true forever because
+    // last_bio_success is never set -> L1 deadlock.
+    state.record_bio_success();
     Ok(())
 }
 
