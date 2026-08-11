@@ -160,7 +160,15 @@ impl State {
     }
 
     pub fn set_sync_timeout(&self) {
-        self.sync_timeout.set(self.sync_timeout_duration);
+        // `sync_interval=0` means the user opted into push-only (no periodic
+        // polling). A zero duration must NOT be turned into sleep(0) here,
+        // because `tokio::time::sleep(0)` resolves immediately, which would
+        // re-trigger `Event::Sync` and create a tight infinite loop that
+        // exhausts file descriptors and wedges the agent. "Don't poll" must
+        // mean "don't arm the timer", not "arm a 0-second timer".
+        if self.sync_timeout_duration > std::time::Duration::ZERO {
+            self.sync_timeout.set(self.sync_timeout_duration);
+        }
     }
 
     // the way we structure the client/agent split in rbw makes the master
@@ -428,16 +436,69 @@ mod tests {
         // that existed before the fix. l1_alive() must still be false.
         assert!(!state.l1_alive(),
             "keys installed without bio heartbeat must NOT be L1-alive (this models the pre-fix deadlock)");
-        assert!(state.needs_unlock(),
-            "keys without heartbeat must still report needs_unlock");
+        assert!(
+            state.needs_unlock(),
+            "keys without heartbeat must still report needs_unlock"
+        );
 
         // The fix: a cold unlock is a full-trust event and records a bio
         // success, establishing the L1 session.
         state.record_bio_success();
-        assert!(state.l1_alive(),
-            "after record_bio_success (cold-unlock trust), L1 must be alive");
-        assert!(!state.needs_unlock(),
-            "after cold unlock the agent must NOT report needs_unlock");
+        assert!(
+            state.l1_alive(),
+            "after record_bio_success (cold-unlock trust), L1 must be alive"
+        );
+        assert!(
+            !state.needs_unlock(),
+            "after cold unlock the agent must NOT report needs_unlock"
+        );
         assert!(state.with_key(None, |_| ()).is_some());
+    }
+
+    /// Regression: `sync_interval=0` means push-only (no periodic polling).
+    /// Calling `set_sync_timeout()` must NOT arm a zero-second timer, because
+    /// `sleep(0)` resolves immediately and re-triggers `Event::Sync` into an
+    /// infinite loop that exhausts file descriptors. "Don't poll" must mean
+    /// "don't arm the timer". See e2e-real-report.md residual risk #2.
+    #[tokio::test]
+    async fn sync_interval_zero_does_not_arm_a_loop_timer() {
+        let (sync_timeout, mut sync_timer_r) = crate::timeout::Timeout::new();
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let state = State {
+            priv_key: None,
+            org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: None,
+            pam_gate_required: false,
+            sync_timeout,
+            // The push-only default.
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+
+        // Act: simulate "sync completed, arm the next sync timer".
+        state.set_sync_timeout();
+
+        // Assert: no timer fires. With Duration::ZERO, we must NOT have armed
+        // a sleep(0); otherwise this receiver would be ready almost
+        // immediately and Event::Sync would loop.
+        let pinned = std::pin::pin!(sync_timer_r.recv());
+        let fired = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            pinned,
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "sync timer must NOT fire when sync_interval=0; \
+             a fire here means a sleep(0) loop bug is back"
+        );
     }
 }
