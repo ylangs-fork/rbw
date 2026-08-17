@@ -7,8 +7,9 @@ pub struct State {
     // HOOK(shatter): state-machine must preserve this wrapped representation
     // when adding L1 metadata and should use `with_key` for all access.
     pub priv_key: Option<rbw::locked_shatter::ShatteredKeys>,
-    pub org_keys:
-        Option<std::collections::HashMap<String, rbw::locked::Keys>>,
+    pub org_keys: Option<
+        std::collections::HashMap<String, rbw::locked_shatter::ShatteredKeys>,
+    >,
     pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
     pub timeout: crate::timeout::Timeout,
     pub l1_timeout: std::time::Duration,
@@ -63,10 +64,11 @@ impl State {
                     .map(|keys| keys.with_unsealed(std::clone::Clone::clone))
             },
             |id| {
-                self.org_keys
-                    .as_ref()
-                    .and_then(|keys| keys.get(id))
-                    .cloned()
+                self.org_keys.as_ref().and_then(|keys| {
+                    keys.get(id).map(|keys| {
+                        keys.with_unsealed(std::clone::Clone::clone)
+                    })
+                })
             },
         )
     }
@@ -84,7 +86,10 @@ impl State {
             return None;
         }
         if let Some(id) = org_id {
-            self.org_keys.as_ref().and_then(|keys| keys.get(id)).map(f)
+            self.org_keys
+                .as_ref()
+                .and_then(|keys| keys.get(id))
+                .map(|keys| keys.with_unsealed(f))
         } else {
             self.priv_key.as_ref().map(|keys| keys.with_unsealed(f))
         }
@@ -320,6 +325,59 @@ mod tests {
         assert!(state.org_keys.is_none());
         assert!(cancellation.is_cancelled());
         cancellation.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn org_keys_are_shattered_and_reassembled_on_access() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut org_material = rbw::locked::Vec::new();
+        org_material.extend(64_u8..128);
+        let org_keys = rbw::locked::Keys::new(org_material);
+        let mut org_map = std::collections::HashMap::new();
+        org_map.insert(
+            "org-1".to_string(),
+            rbw::locked_shatter::ShatteredKeys::seal(&org_keys),
+        );
+        let state = State {
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
+            org_keys: Some(org_map),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+
+        // The org key round-trips through with_key/key_cloned exactly like
+        // the user key, proving it is reassembled on access rather than
+        // stored as one contiguous plaintext buffer.
+        let via_with_key = state
+            .with_key(Some("org-1"), |k| {
+                (k.enc_key().to_vec(), k.mac_key().to_vec())
+            })
+            .expect("org key should be accessible while L1 is alive");
+        assert_eq!(via_with_key.0, org_keys.enc_key());
+        assert_eq!(via_with_key.1, org_keys.mac_key());
+
+        let via_key_cloned = state
+            .key_cloned(Some("org-1"))
+            .expect("org key should be accessible while L1 is alive");
+        assert_eq!(via_key_cloned.enc_key(), org_keys.enc_key());
+        assert_eq!(via_key_cloned.mac_key(), org_keys.mac_key());
+
+        // An unknown org id must not fall back to the user key or panic.
+        assert!(state.with_key(Some("org-missing"), |_| ()).is_none());
+        assert!(state.key_cloned(Some("org-missing")).is_none());
     }
 
     #[tokio::test]

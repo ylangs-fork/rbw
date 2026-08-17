@@ -364,7 +364,17 @@ async fn login_success(
             let mut state = state.lock().await;
             state.priv_key =
                 Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
-            state.org_keys = Some(org_keys);
+            state.org_keys = Some(
+                org_keys
+                    .iter()
+                    .map(|(id, key)| {
+                        (
+                            id.clone(),
+                            rbw::locked_shatter::ShatteredKeys::seal(key),
+                        )
+                    })
+                    .collect(),
+            );
         }
         Err(e) => return Err(e).context("failed to unlock database"),
     }
@@ -790,7 +800,17 @@ pub async fn unlock_with_device(
         let mut state = state.lock().await;
         ensure_not_cancelled(&cancellation)?;
         state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&key));
-        state.org_keys = Some(org_keys);
+        state.org_keys = Some(
+            org_keys
+                .iter()
+                .map(|(id, key)| {
+                    (
+                        id.clone(),
+                        rbw::locked_shatter::ShatteredKeys::seal(key),
+                    )
+                })
+                .collect(),
+        );
         // Device-auth approval delivered the User Key -> a full-trust event,
         // start the L1 session just like a cold unlock.
         state.record_bio_success();
@@ -1068,7 +1088,14 @@ async fn unlock_success(
 ) -> anyhow::Result<()> {
     let mut state = state.lock().await;
     state.priv_key = Some(rbw::locked_shatter::ShatteredKeys::seal(&keys));
-    state.org_keys = Some(org_keys);
+    state.org_keys = Some(
+        org_keys
+            .iter()
+            .map(|(id, key)| {
+                (id.clone(), rbw::locked_shatter::ShatteredKeys::seal(key))
+            })
+            .collect(),
+    );
     // A cold unlock (master password / TPM helper / device-auth approval) is a
     // full-trust authorization event, stronger than a bio heartbeat, so it
     // starts the L1 session the same way a successful bio gate does.
