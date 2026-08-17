@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use sha2::Digest as _;
+use zeroize::Zeroizing;
 
 pub async fn register(
     sock: &mut crate::sock::Sock,
@@ -1271,7 +1272,7 @@ async fn decrypt_cipher(
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Zeroizing<String>> {
     let plaintext = decrypt_cipher_locked(
         state,
         environment,
@@ -1280,8 +1281,9 @@ async fn decrypt_cipher(
         org_id,
     )
     .await?;
-    String::from_utf8(plaintext.data().to_vec())
-        .context("failed to parse decrypted secret")
+    let plaintext = String::from_utf8(plaintext.data().to_vec())
+        .context("failed to parse decrypted secret")?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 pub async fn decrypt(
@@ -1372,10 +1374,12 @@ async fn respond_ack(sock: &mut crate::sock::Sock) -> anyhow::Result<()> {
 
 async fn respond_decrypt(
     sock: &mut crate::sock::Sock,
-    plaintext: String,
+    plaintext: Zeroizing<String>,
 ) -> anyhow::Result<()> {
-    sock.send(&rbw::protocol::Response::Decrypt { plaintext })
-        .await?;
+    sock.send(&rbw::protocol::Response::Decrypt {
+        plaintext: plaintext.to_string(),
+    })
+    .await?;
 
     Ok(())
 }
@@ -1489,7 +1493,7 @@ pub async fn get_ssh_public_keys(
                     entry.org_id.as_deref(),
                 )
                 .await?;
-                pubkeys.push(plaintext);
+                pubkeys.push(plaintext.to_string());
             }
             rbw::db::EntryData::SecureNote => {
                 let Some(encrypted) = entry.notes.as_deref() else {
@@ -1554,7 +1558,7 @@ pub async fn find_ssh_private_key(
             .await?;
             let public_key_bytes =
                 ssh_agent_lib::ssh_key::PublicKey::from_openssh(
-                    &public_key_plaintext,
+                    public_key_plaintext.as_str(),
                 )
                 .map_err(anyhow::Error::new)?
                 .to_bytes();

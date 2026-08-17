@@ -8,9 +8,6 @@
   approval and rejection of authentication requests. Pending requests can be
   selected by list number or request ID; the ID can be omitted when only one
   request is pending.
-
-## Added
-
 * Added an optional `unlock_helper` configuration field. When set, the
   configured command is invoked (with an empty environment, no stdin, and a
   30-second timeout) during `rbw unlock` before pinentry is consulted. The
@@ -20,14 +17,40 @@
   message to stderr and falls back to the pinentry-based unlock. Configure
   with `rbw config set unlock_helper <cmd>`, clear with
   `rbw config unset unlock_helper` or `rbw config set unlock_helper ""`.
+* Added a built-in read-only `ssh-agent` protocol service (opt-in via
+  `rbw config set ssh_agent.enabled true`) so OpenSSH, Git, and compatible
+  tools can sign with vault-backed SSH keys without writing them to disk.
+  Signing can be gated per-key by OpenSSH fingerprint with `always` (fresh
+  PAM authorization per signature, fails closed if no PAM policy is
+  configured), `l1` (default; requires the agent to already be unlocked, PAM
+  fallback otherwise), or `never` (no additional gate). Includes a worked
+  example for wiring `sudo` to the same agent via the distribution's
+  `pam_ssh_agent_auth` module, with the existing password prompt retained as
+  a fallback.
+* Added in-memory hardening for the decrypted User Key: it is now kept as
+  four independently allocated, XOR-split shares (`ShatteredKeys`) instead of
+  one contiguous plaintext buffer, and is only reassembled for the duration
+  of a single use before being zeroized again. A `memory_guard` ptrace
+  sentinel process also watches the agent's `TracerPid` and clears all key
+  material if the agent is unexpectedly attached to or the sentinel is
+  killed. This raises the cost of generic memory-scanning tools that look
+  for a contiguous key-shaped value; it is not a boundary against an
+  attacker who has reverse-engineered this specific layout and can attach a
+  debugger without changing `TracerPid` (for example, reading
+  `/proc/<pid>/mem` directly).
+* Decrypted entry secrets (`rbw get` output, SSH agent responses) are now
+  held in a self-zeroizing buffer inside the agent process instead of a
+  plain `String`, reducing how long plaintext may remain resident in the
+  agent's memory after use.
 
 ## Changed
 
-* Replaced request-driven key timeout renewal with explicit L1 sessions.
+* Replaced request-driven key timeout renewal with explicit L0/L1 sessions.
   Local agents require fresh dedicated-PAM authorization for secret reads and
   renew `l1_timeout` only after successful authorization. Agents started
   without a secure PAM policy use a non-renewable session capped at ten
-  minutes.
+  minutes. See the README's "Local authorization sessions" section for
+  details.
 
 ## [1.15.0] - 2025-12-31
 
