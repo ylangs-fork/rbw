@@ -1178,11 +1178,18 @@ pub async fn sync(
 async fn decrypt_cipher_locked(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
+    authorization: Option<&crate::state::Cancellation>,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<rbw::locked::Vec> {
     let mut state = state.lock().await;
+    if let Some(authorization) = authorization {
+        anyhow::ensure!(
+            !authorization.is_cancelled(),
+            "decryption authorization was invalidated"
+        );
+    }
     if !state.master_password_reprompt_initialized() {
         let db = load_db().await?;
         state.set_master_password_reprompt(&db.entries);
@@ -1297,6 +1304,7 @@ async fn decrypt_cipher_locked(
 async fn decrypt_cipher(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
+    authorization: Option<&crate::state::Cancellation>,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
@@ -1304,6 +1312,7 @@ async fn decrypt_cipher(
     let plaintext = decrypt_cipher_locked(
         state,
         environment,
+        authorization,
         cipherstring,
         entry_key,
         org_id,
@@ -1318,13 +1327,20 @@ pub async fn decrypt(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
+    authorization: &crate::state::Cancellation,
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let plaintext =
-        decrypt_cipher(state, environment, cipherstring, entry_key, org_id)
-            .await?;
+    let plaintext = decrypt_cipher(
+        state,
+        environment,
+        Some(authorization),
+        cipherstring,
+        entry_key,
+        org_id,
+    )
+    .await?;
     respond_decrypt(sock, plaintext).await?;
 
     Ok(())
@@ -1516,6 +1532,7 @@ pub async fn get_ssh_public_keys(
                 let plaintext = decrypt_cipher(
                     state.clone(),
                     &environment,
+                    None,
                     encrypted,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
@@ -1530,6 +1547,7 @@ pub async fn get_ssh_public_keys(
                 let plaintext = decrypt_cipher_locked(
                     state.clone(),
                     &environment,
+                    None,
                     encrypted,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
@@ -1579,6 +1597,7 @@ pub async fn find_ssh_private_key(
             let public_key_plaintext = decrypt_cipher(
                 state.clone(),
                 &environment,
+                None,
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
@@ -1600,6 +1619,7 @@ pub async fn find_ssh_private_key(
                 let private_key_plaintext = decrypt_cipher_locked(
                     state.clone(),
                     &environment,
+                    None,
                     private_key_enc,
                     entry.key.as_deref(),
                     entry.org_id.as_deref(),
@@ -1615,6 +1635,7 @@ pub async fn find_ssh_private_key(
             let private_key_plaintext = decrypt_cipher_locked(
                 state.clone(),
                 &environment,
+                None,
                 notes,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),

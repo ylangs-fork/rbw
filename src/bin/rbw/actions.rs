@@ -1,8 +1,22 @@
-use std::{io::Read as _, os::unix::ffi::OsStringExt as _};
+use std::{
+    cell::RefCell, io::Read as _, os::unix::ffi::OsStringExt as _,
+};
 
 use anyhow::Context as _;
 
 const AUTH_REQUEST_DISPLAY_FIELD_MAX: usize = 256;
+
+enum DecryptSocket {
+    Unconnected,
+    Connected(crate::sock::Sock),
+    Failed,
+}
+
+thread_local! {
+    // Only Decrypt shares a connection; a failed channel is never reopened.
+    static DECRYPT_SOCKET: RefCell<DecryptSocket> =
+        const { RefCell::new(DecryptSocket::Unconnected) };
+}
 
 pub fn auth_request_display_field(value: &str) -> String {
     let mut output = String::new();
@@ -206,24 +220,41 @@ pub fn decrypt(
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let mut sock = connect()?;
-    sock.send(&rbw::protocol::Request::new(
-        get_environment(),
-        rbw::protocol::Action::Decrypt {
-            cipherstring: cipherstring.to_string(),
-            entry_key: entry_key.map(std::string::ToString::to_string),
-            org_id: org_id.map(std::string::ToString::to_string),
-        },
-    ))?;
+    DECRYPT_SOCKET.with(|state| {
+        let mut state = state.borrow_mut();
+        // Mark the channel failed before doing I/O, including the first connect.
+        // Optional-field callers may ignore errors, but must not reauthenticate.
+        let mut sock =
+            match std::mem::replace(&mut *state, DecryptSocket::Failed) {
+                DecryptSocket::Unconnected => connect()?,
+                DecryptSocket::Connected(sock) => sock,
+                DecryptSocket::Failed => {
+                    anyhow::bail!(
+                        "decrypt connection is unavailable after an earlier failure"
+                    );
+                }
+            };
+        sock.send(&rbw::protocol::Request::new(
+            get_environment(),
+            rbw::protocol::Action::Decrypt {
+                cipherstring: cipherstring.to_string(),
+                entry_key: entry_key.map(std::string::ToString::to_string),
+                org_id: org_id.map(std::string::ToString::to_string),
+            },
+        ))?;
 
-    let res = sock.recv()?;
-    match res {
-        rbw::protocol::Response::Decrypt { plaintext } => Ok(plaintext),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to decrypt: {error}"))
+        let res = sock.recv()?;
+        match res {
+            rbw::protocol::Response::Decrypt { plaintext } => {
+                *state = DecryptSocket::Connected(sock);
+                Ok(plaintext)
+            }
+            rbw::protocol::Response::Error { error } => {
+                Err(anyhow::anyhow!("failed to decrypt: {error}"))
+            }
+            _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
         }
-        _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
-    }
+    })
 }
 
 pub fn encrypt(

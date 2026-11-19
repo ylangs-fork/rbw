@@ -22,11 +22,11 @@ printf 'success\n' >"$control/result"
 printf 'deny\n' >"$control/pinentry"
 chmod 0644 "$control/result" "$control/pinentry"
 touch "$control/events" "$control/pinentry-events"
-chmod 0622 "$control/events" "$control/pinentry-events"
+chmod 0666 "$control/events" "$control/pinentry-events"
 printf 'allow\n' >"$control/notification-result"
 chmod 0644 "$control/notification-result"
 touch "$control/notifications"
-chmod 0622 "$control/notifications"
+chmod 0666 "$control/notifications"
 
 user() {
     runuser -u rbw -- env HOME="$HOME" RBW_PROFILE="$RBW_PROFILE" \
@@ -107,6 +107,251 @@ PY
 }
 set_result() { printf '%s\n' "$1" >"$control/result"; }
 event_count() { wc -l <"$control/events"; }
+
+# Keep this helper inline so the existing offline image runs the exact regression
+# without additional host tools or fixture-generator/Dockerfile changes.
+command_auth_regression() {
+    if ! user timeout 60 python3 - "$work" "$fixture" "$login" "$policy" "$control" \
+        >"$work/command-auth.out" 2>"$work/command-auth.err" <<'PY'
+import base64
+import copy
+import json
+import os
+import pathlib
+import socket
+import subprocess
+import sys
+
+work, fixture, login, policy, control = sys.argv[1:]
+work, fixture, control = map(pathlib.Path, (work, fixture, control))
+expected = (fixture / "expected-secret").read_bytes()
+socket_path = str(pathlib.Path(os.environ["SSH_AUTH_SOCK"]).with_name("socket"))
+environment = {
+    "tty": None,
+    "env_vars": [
+        [base64.b64encode(name.encode()).decode(),
+         base64.b64encode(os.environ[name].encode()).decode()]
+        for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+    ],
+}
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("command authorization regression: " + message)
+
+def counts():
+    return tuple(len((control / name).read_bytes().splitlines())
+                 for name in ("events", "notifications"))
+
+def delta(before, amount, label):
+    require(counts() == tuple(value + amount for value in before),
+            label + " changed PAM/notification counts unexpectedly")
+
+def cli(*args):
+    result = subprocess.run(["rbw", *args], capture_output=True, timeout=10)
+    require(result.returncode == 0, "synthetic CLI command failed")
+    require(expected.strip() not in result.stderr
+            and b"rbw-e2e-password" not in result.stderr,
+            "credential appeared in CLI diagnostics")
+    return result.stdout
+
+def privileged(*args, data=None):
+    result = subprocess.run(["sudo", *map(str, args)], input=data,
+                            capture_output=True, timeout=5)
+    require(result.returncode == 0, "fixture control operation failed")
+
+def set_control(name, value):
+    privileged("tee", control / name, data=(value + "\n").encode())
+
+class Channel:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(5)
+        self.socket.connect(socket_path)
+        self.reader = self.socket.makefile("rb")
+
+    def send(self, *actions, request_environment=environment):
+        self.socket.sendall(b"".join(
+            json.dumps({"environment": request_environment, "action": action}).encode()
+            + b"\n" for action in actions))
+
+    def receive(self):
+        line = self.reader.readline()
+        require(bool(line), "connection closed before its response")
+        return json.loads(line)
+
+    def close(self):
+        self.reader.close()
+        self.socket.close()
+
+def request(action):
+    channel = Channel()
+    try:
+        channel.send(action)
+        return channel.receive()
+    finally:
+        channel.close()
+
+def encrypt(text):
+    response = request({"type": "Encrypt", "plaintext": text, "org_id": None})
+    require(response["type"] == "Encrypt", "fixture encryption failed")
+    return response["cipherstring"]
+
+# The older SSH fixture has a plaintext name, so make every searchable name a
+# valid cipherstring, then add a distinct encrypted login and populated fields.
+# All changes are confined to this disposable user's synthetic database.
+databases = list((pathlib.Path.home() / ".cache/rbw-face-smoke").glob("*.json"))
+require(len(databases) == 1, "expected exactly one synthetic database")
+database = databases[0]
+db = json.loads(database.read_text())
+target = next(entry for entry in db["entries"] if entry["id"] == login)
+ssh = next(entry for entry in db["entries"] if entry["id"] == "ssh-agent-e2e-key")
+ssh["name"] = encrypt("Face smoke SSH key")
+target["folder"] = target["name"]
+target["notes"] = target["name"]
+target["data"]["Login"]["username"] = target["name"]
+target["data"]["Login"]["uris"] = [{"uri": target["name"], "match_type": None}]
+target["fields"] = [{"ty": None, "name": target["name"],
+                     "value": target["name"], "linked_id": None}]
+distractor = copy.deepcopy(target)
+distractor["id"] = "4f7ca7aa-3da1-43cb-8438-27e9548f44e2"
+distractor["name"] = encrypt("Face smoke distractor")
+db["entries"].append(distractor)
+database.write_text(json.dumps(db))
+
+# Exercise actual name search across every entry, not the UUID fast path.
+# Check the complete returned secret and exact deltas for BOTH invocations.
+for _ in range(2):
+    before = counts()
+    require(cli("get", "Face smoke synthetic login") == expected,
+            "by-name get returned the wrong synthetic secret")
+    delta(before, 1, "one by-name command")
+
+# A literal missing name still searches the full vault, but must terminate
+# after one authorization rather than repeatedly prompting for each field.
+before = counts()
+missing = subprocess.run(
+    ["rbw", "get", "Face smoke literal name that does not exist"],
+    capture_output=True, timeout=10)
+require(missing.returncode != 0 and missing.stdout == b""
+        and b"no entry found" in missing.stderr,
+        "missing literal name did not terminate with no-entry failure")
+require(expected.strip() not in missing.stderr
+        and b"rbw-e2e-password" not in missing.stderr,
+        "missing literal name exposed a credential")
+delta(before, 1, "missing literal-name command")
+
+decrypt = {"type": "Decrypt",
+           "cipherstring": target["data"]["Login"]["password"],
+           "entry_key": target["key"], "org_id": target["org_id"]}
+
+def plaintext(channel):
+    response = channel.receive()
+    require(response["type"] == "Decrypt"
+            and response["plaintext"].encode() + b"\n" == expected,
+            "raw decrypt returned the wrong synthetic secret")
+
+def approved_channel():
+    before = counts()
+    channel = Channel()
+    channel.send(decrypt)
+    plaintext(channel)
+    delta(before, 1, "new raw connection")
+    return channel
+
+def rejected_and_closed(channel, request_environment=environment):
+    try:
+        channel.send(decrypt, request_environment=request_environment)
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    try:
+        line = channel.reader.readline()
+        if line:
+            require(json.loads(line)["type"] == "Error",
+                    "invalidated connection returned plaintext")
+            require(channel.reader.readline() == b"",
+                    "failed connection remained usable")
+    except ConnectionResetError:
+        pass
+
+channel = approved_channel()
+try:
+    before = counts()
+    channel.send(decrypt)
+    plaintext(channel)
+    # Two messages in one write must not lose buffered/pipelined bytes.
+    channel.send(decrypt, decrypt)
+    plaintext(channel)
+    plaintext(channel)
+    delta(before, 0, "sequential and pipelined decrypts")
+finally:
+    channel.close()
+
+# Each invalidation is acknowledged before attempting another scalar request:
+# no arbitrary delays or races against a background control command.
+for invalidation in ("lock-unlock", "reload", "policy-removal"):
+    channel = approved_channel()
+    removed_policy = work / "lease-removed-policy"
+    try:
+        if invalidation == "lock-unlock":
+            require(request({"type": "Lock"})["type"] == "Ack", "lock failed")
+            set_control("pinentry", "allow")
+            try:
+                cli("unlock")
+            finally:
+                set_control("pinentry", "deny")
+        elif invalidation == "reload":
+            require(request({"type": "ReloadSessionConfig"})["type"] == "Ack",
+                    "session reload failed")
+        else:
+            privileged("mv", policy, removed_policy)
+        before = counts()
+        rejected_and_closed(channel)
+        delta(before, 0, invalidation + " on an old connection")
+    finally:
+        channel.close()
+        if removed_policy.exists():
+            privileged("install", "-o", "root", "-g", "root", "-m", "0644",
+                       removed_policy, policy)
+            privileged("rm", removed_policy)
+    # Invalidation must not break future commands or carry approval to them.
+    approved_channel().close()
+
+# Approval belongs to the original environment as well as the connection.
+channel = approved_channel()
+try:
+    before = counts()
+    changed_environment = copy.deepcopy(environment)
+    changed_environment["tty"] = base64.b64encode(b"/dev/face-smoke-other-tty").decode()
+    rejected_and_closed(channel, changed_environment)
+    delta(before, 0, "environment change on an approved connection")
+finally:
+    channel.close()
+
+set_control("result", "auth_err")
+channel = Channel()
+try:
+    before = counts()
+    channel.send(decrypt, decrypt)
+    require(channel.receive()["type"] == "Error", "denied PAM returned plaintext")
+    try:
+        require(channel.reader.readline() == b"", "denial did not close connection")
+    except ConnectionResetError:
+        pass
+    delta(before, 1, "pipelined denial")
+finally:
+    channel.close()
+    set_control("result", "success")
+approved_channel().close()
+PY
+    then
+        assert_no_secret "$work/command-auth.out" "$work/command-auth.err"
+        cat "$work/command-auth.err" >&2
+        fail 'command authorization regression failed'
+    fi
+    assert_no_secret "$work/command-auth.out" "$work/command-auth.err"
+    printf 'face smoke: by-name multi-entry/field get authenticates once per command; scalar leases preserve pipelining and reject lock/reload/policy loss and denied reuse passed\n'
+}
 system_pam_snapshot() {
     find /etc/pam.d -maxdepth 1 -type f ! -name rbw-device-auth -exec sha256sum '{}' + | sort
 }
@@ -275,6 +520,7 @@ start_agent
 cold_unlock
 [[ $(wc -l <"$control/pinentry-events") == $((pinentry_before + 1)) ]] || fail 'cold unlock did not use the synthetic master-password prompt exactly once'
 set_result success
+command_auth_regression
 get_secret
 [[ $(wc -l <"$control/notifications") -gt 0 ]] || fail 'secret access delivered no desktop notification'
 # A PAM_ERROR_MSG is diagnostic only: successful PAM remains authoritative.

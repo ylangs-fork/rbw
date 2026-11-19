@@ -152,6 +152,12 @@ starts, secret reads and explicit syncs require a fresh PAM authorization; a
 successful authorization both permits that action and renews `l1_timeout`.
 This makes PAM a user-presence gate, not a source of key material.
 
+One CLI command uses one dedicated decryption connection: searching encrypted
+names and reading the selected entry share one face authorization, not one per
+field. Each new command opens a new connection and authenticates again. The
+approval never crosses connections or survives a lock, session reload, expiry,
+policy failure or connection error; there is no global biometric grace period.
+
 If no secure policy exists when the agent starts, it selects remote mode for
 that process: the general secret-access gate is bypassed, the effective L1
 lifetime is capped at ten minutes, and no request can renew it. The mode is
