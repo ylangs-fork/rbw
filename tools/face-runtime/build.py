@@ -68,8 +68,9 @@ def unpack(archive):
             if not (member.isdir() or member.isfile() or member.issym()):
                 raise RuntimeError("unexpected source archive member: " + member.name)
             if member.issym():
-                target = Path(member.linkname)
-                if target.is_absolute() or ".." in target.parts:
+                link = Path(member.linkname)
+                target = (WORK / path.parent / link).resolve()
+                if link.is_absolute() or not target.is_relative_to(WORK):
                     raise RuntimeError("unsafe source archive link: " + member.name)
         source.extractall(WORK)
 
