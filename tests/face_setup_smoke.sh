@@ -401,9 +401,11 @@ printf 'face smoke: notification denial fails closed; explicit enable survives p
 [[ -f /input/face-runtime.tar.gz ]] || fail 'mount the published precompiled face runtime at /input/face-runtime.tar.gz'
 rm "$policy" "$module"
 rm -rf /etc/howdy
-install -d /usr/local/libexec
-printf 'corrupt archive fixture\n' >/usr/local/libexec/face-runtime.tar.gz
-chown rbw:rbw /usr/local/libexec/face-runtime.tar.gz
+package_root=$(dirname "$(dirname "$(readlink -f "$(command -v rbw)")")")
+package_archive="$package_root/libexec/face-runtime.tar.gz"
+install -d "$package_root/libexec"
+printf 'corrupt archive fixture\n' >"$package_archive"
+chown rbw:rbw "$package_archive"
 mv /usr/bin/apt-get "$fixture/apt-get-disabled"
 ! command -v cc >/dev/null || fail 'runtime test image unexpectedly contains a compiler'
 python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
@@ -415,8 +417,8 @@ path.write_text(json.dumps(config))
 PY
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ ! -e /usr/lib/security/rbw-howdy ]] || fail 'corrupt archive was privileged-extracted'
-cp /input/face-runtime.tar.gz /usr/local/libexec/face-runtime.tar.gz
-chown rbw:rbw /usr/local/libexec/face-runtime.tar.gz
+cp /input/face-runtime.tar.gz "$package_archive"
+chown rbw:rbw "$package_archive"
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ -f /usr/lib/security/rbw-howdy/pam_howdy.so ]] || fail 'valid precompiled runtime was not deployed'
 [[ ! -e /etc/rbw-howdy ]] || fail 'no-camera failure did not remove newly created enrollment configuration'
