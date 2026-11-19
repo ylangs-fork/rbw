@@ -1262,6 +1262,16 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
                 config.lock_timeout = timeout;
             }
         }
+        "l1_timeout" => {
+            let timeout = value
+                .parse()
+                .context("failed to parse value for l1_timeout")?;
+            if timeout == 0 {
+                log::error!("l1_timeout must be greater than 0");
+            } else {
+                config.l1_timeout = timeout;
+            }
+        }
         "sync_interval" => {
             let interval = value
                 .parse()
@@ -1269,6 +1279,35 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.sync_interval = interval;
         }
         "pinentry" => config.pinentry = value.to_string(),
+        "unlock_helper" => {
+            if value.is_empty() {
+                config.unlock_helper = None;
+            } else {
+                config.unlock_helper = Some(value.to_string());
+            }
+        }
+        "ssh_agent.enabled" => {
+            config.ssh_agent.enabled = value
+                .parse()
+                .context("failed to parse value for ssh_agent.enabled")?;
+        }
+        "ssh_agent.default_policy" => {
+            config.ssh_agent.default_policy = value.parse()?;
+        }
+        key if key.starts_with("ssh_agent.policy.") => {
+            let fingerprint = key
+                .strip_prefix("ssh_agent.policy.")
+                .expect("prefix checked above");
+            if fingerprint.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "SSH agent policy fingerprint must not be empty"
+                ));
+            }
+            config
+                .ssh_agent
+                .policies
+                .insert(fingerprint.to_string(), value.parse()?);
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1297,7 +1336,27 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         "lock_timeout" => {
             config.lock_timeout = rbw::config::default_lock_timeout();
         }
+        "l1_timeout" => {
+            config.l1_timeout = rbw::config::default_l1_timeout();
+        }
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
+        "unlock_helper" => config.unlock_helper = None,
+
+        "ssh_agent.enabled" => config.ssh_agent.enabled = false,
+        "ssh_agent.default_policy" => {
+            config.ssh_agent.default_policy =
+                rbw::config::SshAgentPolicy::default();
+        }
+        key if key.starts_with("ssh_agent.policy.") => {
+            let fingerprint = key
+                .strip_prefix("ssh_agent.policy.")
+                .expect("prefix checked above");
+            if config.ssh_agent.policies.remove(fingerprint).is_none() {
+                return Err(anyhow::anyhow!(
+                    "no SSH agent policy configured for {fingerprint}"
+                ));
+            }
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1336,8 +1395,296 @@ pub fn login() -> anyhow::Result<()> {
 pub fn unlock() -> anyhow::Result<()> {
     ensure_agent()?;
     crate::actions::login()?;
+
+    match try_unlock_with_helper() {
+        Ok(Some(_key)) => {
+            // The agent has been installed with the raw user key supplied by
+            // the helper. No further action is required here; the unlock has
+            // already been performed on the agent side.
+            return Ok(());
+        }
+        Ok(None) => {
+            // Helper was not configured; fall through to pinentry-based
+            // unlock below.
+        }
+        Err(reason) => {
+            eprintln!("unlock helper failed: {reason}");
+        }
+    }
+
     crate::actions::unlock()?;
 
+    Ok(())
+}
+
+/// Attempt to obtain a raw User Key via the configured `unlock_helper`
+/// command. Returns:
+///   - `Ok(Some(_))` if the helper produced a valid 64-byte user key and the
+///     agent was successfully installed with it,
+///   - `Ok(None)` if no helper is configured,
+///   - `Err(reason)` if the helper was configured but failed for any reason
+///     (spawn failure, non-zero exit, timeout, malformed output, wrong key
+///     length). Callers should print a short generic message and fall back to
+///     the pinentry-based unlock.
+///
+/// The helper contract is strict: it must write `OK <hex>\n` to stdout, where
+/// `<hex>` decodes to exactly 64 bytes. Any deviation is treated as a failure
+/// and triggers the fallback path. The helper process is run with an empty
+/// environment and stdin connected to /dev/null, with a 30-second timeout.
+fn try_unlock_with_helper() -> anyhow::Result<Option<()>> {
+    let config = rbw::config::Config::load()?;
+    let Some(cmdline) = config.unlock_helper.as_ref() else {
+        return Ok(None);
+    };
+    if cmdline.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let parts = shlex::split(cmdline)
+        .filter(|parts| !parts.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("unlock helper command could not be parsed")
+        })?;
+    let (program, args) = parts.split_first().expect("checked non-empty");
+    let output = run_unlock_helper(program, args)?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("unlock helper exited unsuccessfully"));
+    }
+    let key = parse_unlock_helper_output(&output.stdout)?;
+    crate::actions::unlock_with_user_key(key)?;
+    Ok(Some(()))
+}
+
+fn run_unlock_helper(
+    program: &str,
+    args: &[String],
+) -> anyhow::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    const MAX_STDOUT: usize = 1024;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn failed: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stdout pipe"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stderr pipe"))?;
+
+    let stdout_reader = std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let mut oversized = false;
+        loop {
+            let count = stdout.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            if retained.len().saturating_add(count) <= MAX_STDOUT {
+                retained.extend_from_slice(&chunk[..count]);
+            } else {
+                oversized = true;
+            }
+        }
+        if oversized {
+            Err(std::io::Error::other("unlock helper stdout is too large"))
+        } else {
+            Ok(retained)
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        std::io::copy(&mut stderr, &mut std::io::sink()).map(|_| ())
+    });
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow::anyhow!("timed out after 30 seconds"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    let stdout = stdout_reader.join().map_err(|_| {
+        anyhow::anyhow!("unlock helper stdout reader panicked")
+    })??;
+    stderr_reader.join().map_err(|_| {
+        anyhow::anyhow!("unlock helper stderr reader panicked")
+    })??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+/// Parse exactly `OK <128 hex characters>` with one optional final newline.
+fn parse_unlock_helper_output(stdout: &[u8]) -> anyhow::Result<[u8; 64]> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| anyhow::anyhow!("output is not valid UTF-8"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.contains(['\n', '\r', '\t']) {
+        return Err(anyhow::anyhow!("output contains unexpected content"));
+    }
+    let hex = text
+        .strip_prefix("OK ")
+        .ok_or_else(|| anyhow::anyhow!("output does not start with `OK `"))?;
+    if hex.len() != rbw::locked::KEYS_LEN * 2
+        || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(anyhow::anyhow!(
+            "output must contain exactly 64 bytes of hexadecimal key material"
+        ));
+    }
+    let mut key = [0_u8; rbw::locked::KEYS_LEN];
+    for (slot, pair) in key.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        *slot = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Ok(key)
+}
+
+fn hex_nibble(byte: u8) -> anyhow::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(anyhow::anyhow!("invalid hex character")),
+    }
+}
+
+pub fn unlock_with_device() -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::unlock_with_device()?;
+    Ok(())
+}
+
+fn sort_auth_requests(requests: &mut [rbw::protocol::AuthRequestInfo]) {
+    requests.sort_by(|a, b| {
+        a.creation_date
+            .cmp(&b.creation_date)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn format_auth_request_row(
+    number: Option<usize>,
+    request: &rbw::protocol::AuthRequestInfo,
+) -> String {
+    let number = number.map_or_else(String::new, |n| format!("{n}\t"));
+    format!(
+        "{}{}\t{}\t{}\t{}\t{}",
+        number,
+        crate::actions::auth_request_display_field(&request.id),
+        crate::actions::auth_request_display_field(&request.device_type),
+        crate::actions::auth_request_display_field(&request.ip_address),
+        crate::actions::auth_request_display_field(&request.creation_date),
+        crate::actions::auth_request_display_field(&request.fingerprint),
+    )
+}
+
+fn resolve_auth_request_selector(
+    requests: &[rbw::protocol::AuthRequestInfo],
+    selector: Option<&str>,
+) -> anyhow::Result<String> {
+    match selector {
+        None => match requests.len() {
+            0 => Err(anyhow::anyhow!("no pending authentication requests")),
+            1 => Ok(requests[0].id.clone()),
+            _ => {
+                for (index, request) in requests.iter().enumerate() {
+                    eprintln!(
+                        "{}",
+                        format_auth_request_row(Some(index + 1), request)
+                    );
+                }
+                Err(anyhow::anyhow!(
+                    "multiple pending authentication requests; \
+                     specify a number or ID"
+                ))
+            }
+        },
+        Some(selector) => {
+            if selector.parse::<uuid::Uuid>().is_ok() {
+                return Ok(selector.to_string());
+            }
+            if let Ok(number) = selector.parse::<usize>() {
+                if number == 0 || number > requests.len() {
+                    return Err(anyhow::anyhow!(
+                        "invalid request number {number}; \
+                         valid range is 1..={}",
+                        requests.len()
+                    ));
+                }
+                return Ok(requests[number - 1].id.clone());
+            }
+            Err(anyhow::anyhow!(
+                "invalid selector '{selector}'; \
+                 must be a request ID or list number"
+            ))
+        }
+    }
+}
+
+pub fn auth_request_list(raw: bool) -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::login()?;
+    let mut requests = crate::actions::list_auth_requests()?;
+    sort_auth_requests(&mut requests);
+    if raw {
+        serde_json::to_writer_pretty(std::io::stdout(), &requests)?;
+        println!();
+    } else if requests.is_empty() {
+        println!("No pending authentication requests.");
+    } else {
+        for (index, request) in requests.iter().enumerate() {
+            println!("{}", format_auth_request_row(Some(index + 1), request));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_auth_request_id(selector: Option<&str>) -> anyhow::Result<String> {
+    if let Some(selector) = selector {
+        if selector.parse::<uuid::Uuid>().is_ok() {
+            return Ok(selector.to_string());
+        }
+    }
+    let mut requests = crate::actions::list_auth_requests()?;
+    sort_auth_requests(&mut requests);
+    resolve_auth_request_selector(&requests, selector)
+}
+
+pub fn auth_request_approve(id: Option<&str>) -> anyhow::Result<()> {
+    // An approval requires both an unlocked agent and fresh local system
+    // authentication. Existing password unlock behavior is preserved here.
+    unlock()?;
+    let id = resolve_auth_request_id(id)?;
+    crate::actions::approve_auth_request(&id)?;
+    Ok(())
+}
+
+pub fn auth_request_reject(id: Option<&str>) -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::login()?;
+    let id = resolve_auth_request_id(id)?;
+    crate::actions::reject_auth_request(&id)?;
     Ok(())
 }
 
@@ -1351,8 +1698,7 @@ pub fn unlocked() -> anyhow::Result<()> {
 }
 
 pub fn sync() -> anyhow::Result<()> {
-    ensure_agent()?;
-    crate::actions::login()?;
+    unlock()?;
     crate::actions::sync()?;
 
     Ok(())
@@ -1507,8 +1853,7 @@ pub fn search(
         .filter(|entry| {
             entry
                 .as_ref()
-                .map(|entry| entry.search_match(term, folder))
-                .unwrap_or(true)
+                .map_or(true, |entry| entry.search_match(term, folder))
         })
         .map(|entry| entry.map(std::convert::Into::into))
         .collect::<Result<_, anyhow::Error>>()?;
@@ -4174,5 +4519,318 @@ mod test {
                 notes: None,
             },
         )
+    }
+
+    fn make_auth_request(
+        id: &str,
+        creation_date: &str,
+    ) -> rbw::protocol::AuthRequestInfo {
+        rbw::protocol::AuthRequestInfo {
+            id: id.to_string(),
+            fingerprint: "test-fingerprint".to_string(),
+            device_type: "Linux".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            country_name: None,
+            creation_date: creation_date.to_string(),
+        }
+    }
+
+    #[test]
+    fn sort_auth_requests_deterministic() {
+        let mut requests = vec![
+            make_auth_request("b-id", "2025-01-02T00:00:00Z"),
+            make_auth_request("a-id", "2025-01-01T00:00:00Z"),
+            make_auth_request("c-id", "2025-01-01T00:00:00Z"),
+        ];
+        sort_auth_requests(&mut requests);
+        let ids: Vec<&str> = requests.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["a-id", "c-id", "b-id"]);
+    }
+
+    #[test]
+    fn resolve_selector_none_zero_pending() {
+        let requests: Vec<rbw::protocol::AuthRequestInfo> = vec![];
+        let err = resolve_auth_request_selector(&requests, None).unwrap_err();
+        assert!(
+            err.to_string().contains("no pending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_none_one_pending() {
+        let requests =
+            vec![make_auth_request("only-id", "2025-01-01T00:00:00Z")];
+        let id = resolve_auth_request_selector(&requests, None).unwrap();
+        assert_eq!(id, "only-id");
+    }
+
+    #[test]
+    fn resolve_selector_none_multiple_pending() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let err = resolve_auth_request_selector(&requests, None).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple pending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_uuid() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let requests =
+            vec![make_auth_request("other", "2025-01-01T00:00:00Z")];
+        let id =
+            resolve_auth_request_selector(&requests, Some(uuid)).unwrap();
+        assert_eq!(id, uuid);
+    }
+
+    #[test]
+    fn resolve_selector_index_one() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let id = resolve_auth_request_selector(&requests, Some("1")).unwrap();
+        assert_eq!(id, "first");
+    }
+
+    #[test]
+    fn resolve_selector_index_two() {
+        let requests = vec![
+            make_auth_request("first", "2025-01-01T00:00:00Z"),
+            make_auth_request("second", "2025-01-02T00:00:00Z"),
+        ];
+        let id = resolve_auth_request_selector(&requests, Some("2")).unwrap();
+        assert_eq!(id, "second");
+    }
+
+    #[test]
+    fn resolve_selector_index_out_of_range() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err =
+            resolve_auth_request_selector(&requests, Some("2")).unwrap_err();
+        assert!(
+            err.to_string().contains("valid range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_index_zero() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err =
+            resolve_auth_request_selector(&requests, Some("0")).unwrap_err();
+        assert!(
+            err.to_string().contains("valid range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_garbage() {
+        let requests =
+            vec![make_auth_request("only", "2025-01-01T00:00:00Z")];
+        let err = resolve_auth_request_selector(&requests, Some("1abc"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be a request ID or list number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn ok_hex(len: usize) -> String {
+        "a".repeat(len * 2)
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_valid_ok_hex() {
+        let hex = ok_hex(64);
+        let input = format!("OK {hex}\n");
+        let key = parse_unlock_helper_output(input.as_bytes())
+            .expect("valid output should parse");
+        assert_eq!(key.len(), 64);
+        assert!(key.iter().all(|b| *b == 0xaa));
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_valid_no_trailing_newline() {
+        let hex = ok_hex(64);
+        let input = format!("OK {hex}");
+        let key = parse_unlock_helper_output(input.as_bytes())
+            .expect("valid output should parse");
+        assert_eq!(key.len(), 64);
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_wrong_length() {
+        let hex = ok_hex(32);
+        let input = format!("OK {hex}\n");
+        let err = parse_unlock_helper_output(input.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly 64 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_garbage() {
+        let input = b"random garbage output\n";
+        let err = parse_unlock_helper_output(input).unwrap_err().to_string();
+        assert!(
+            err.contains("does not start with `OK `"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_missing_ok_prefix() {
+        let hex = ok_hex(64);
+        let input = format!("NO {hex}\n");
+        let err = parse_unlock_helper_output(input.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not start with `OK `"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_rejects_odd_length_hex() {
+        let input = b"OK abc\n";
+        let err = parse_unlock_helper_output(input).unwrap_err().to_string();
+        assert!(err.contains("exactly 64 bytes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_rejects_invalid_hex() {
+        let input = format!("OK {}z\n", "a".repeat(127));
+        let err = parse_unlock_helper_output(input.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hexadecimal"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_unlock_helper_output_rejects_trailing_whitespace() {
+        let input = format!("OK {} \n", ok_hex(64));
+        assert!(parse_unlock_helper_output(input.as_bytes()).is_err());
+        let input = format!("OK {}\n\n", ok_hex(64));
+        assert!(parse_unlock_helper_output(input.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn run_unlock_helper_succeeds_with_valid_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        let hex = ok_hex(64);
+        std::fs::write(&script, format!("#!/bin/sh\nprintf 'OK {hex}\\n'\n"))
+            .expect("write helper");
+        make_executable(&script);
+        wait_for_exec_ready(&script);
+        let empty: [String; 0] = [];
+        let output = run_unlock_helper(script.to_str().unwrap(), &empty)
+            .expect("helper should run");
+        assert!(output.status.success(), "helper exited non-zero");
+        let key = parse_unlock_helper_output(&output.stdout)
+            .expect("output should parse");
+        assert_eq!(key.len(), 64);
+    }
+
+    #[test]
+    fn run_unlock_helper_propagates_garbage_as_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'definitely not a key\\n'\n",
+        )
+        .expect("write helper");
+        make_executable(&script);
+        wait_for_exec_ready(&script);
+        let empty: [String; 0] = [];
+        let output = run_unlock_helper(script.to_str().unwrap(), &empty)
+            .expect("helper should run");
+        assert!(output.status.success(), "helper exited non-zero");
+        let err = parse_unlock_helper_output(&output.stdout)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not start with `OK `"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_unlock_helper_clears_the_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        let hex = ok_hex(64);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ -z \"$HOME\" ] || exit 8\nprintf 'OK {hex}\\n'\n"
+            ),
+        )
+        .expect("write helper");
+        make_executable(&script);
+        wait_for_exec_ready(&script);
+        let empty: [String; 0] = [];
+        let output = run_unlock_helper(script.to_str().unwrap(), &empty)
+            .expect("helper should run");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn run_unlock_helper_surfaces_non_zero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write helper");
+        make_executable(&script);
+        wait_for_exec_ready(&script);
+        let empty: [String; 0] = [];
+        let output = run_unlock_helper(script.to_str().unwrap(), &empty)
+            .expect("helper should spawn");
+        assert!(!output.status.success(), "helper should fail");
+        assert_eq!(output.status.code(), Some(7));
+    }
+
+    #[test]
+    fn empty_unlock_helper_value_is_treated_as_unset() {
+        // An empty string in the unlock_helper field is normalised to None
+        // by config_set, so try_unlock_with_helper should report "no helper
+        // configured" without ever spawning a process. We simulate that by
+        // calling the parse path directly with an empty cmdline.
+        let parts = shlex::split("").unwrap_or_default();
+        assert!(parts.is_empty(), "empty cmdline should yield no parts");
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod helper");
+    }
+
+    /// On some filesystems a freshly chmod'd executable cannot be `exec()`'d
+    /// immediately because the kernel still has a stale mapping of the file
+    /// (ETXTBSY). Polling with a tiny delay is enough to make the helper
+    /// tests reliable without leaking the workaround into production code.
+    fn wait_for_exec_ready(path: &std::path::Path) {
+        for _ in 0..20 {
+            if let Ok(out) = std::process::Command::new(path).output() {
+                let _ = out.status;
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

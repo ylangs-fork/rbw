@@ -9,6 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --all-targets --all-features
@@ -38,6 +39,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-features
@@ -59,6 +61,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,6 +74,7 @@ jobs:
   doc:
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - run: RUSTDOCFLAGS="-Dwarnings" cargo doc --all-features

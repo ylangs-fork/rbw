@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7-labs
+# Build (repo root): docker build --progress=plain -f tests/Dockerfile.face-smoke -t rbw-face-smoke .
+# Run without vault/network/devices: docker run --rm --network none rbw-face-smoke
+FROM rust:1.92.0-bookworm AS builder
+WORKDIR /src
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libpam0g-dev openssh-client
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY tests/ssh_agent_e2e_fixture.rs tests/ssh_agent_e2e_fixture.rs
+COPY tests/pam_howdy_smoke.c tests/pam_howdy_smoke.c
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --locked --release --bins --no-default-features \
+    && install -d /out/home /tmp/face-fixture-runtime \
+    && install target/release/rbw target/release/rbw-agent /out/ \
+    && ssh-keygen -q -t ed25519 -N '' -C face-smoke -f /tmp/face-fixture-key \
+    && HOME=/out/home XDG_RUNTIME_DIR=/tmp/face-fixture-runtime RBW_PROFILE=face-smoke \
+       RBW_E2E_FACE_SMOKE=1 RBW_E2E_PRIVATE_KEY=/tmp/face-fixture-key \
+       RBW_E2E_PUBLIC_KEY=/tmp/face-fixture-key.pub \
+       RBW_E2E_PINENTRY=/usr/local/bin/face-smoke-pinentry \
+       cargo test --locked --release --no-default-features --test ssh_agent_e2e_fixture \
+       -- --ignored --exact create_ssh_agent_fixture \
+    && install /tmp/face-fixture-key.pub /out/public-key \
+    && cc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
+       tests/pam_howdy_smoke.c -o /out/pam_howdy.so -lpam
+
+FROM debian:bookworm-slim
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+       libpam0g libpam-modules openssh-client python3 procps tini util-linux \
+    && useradd --create-home --uid 1100 --shell /bin/bash rbw \
+    && install -d /usr/lib/security /opt/face-fixture /tmp/face-smoke-runtime \
+    && chown rbw:rbw /tmp/face-smoke-runtime \
+    && chmod 0700 /tmp/face-smoke-runtime
+COPY --from=builder /out/rbw /out/rbw-agent /usr/local/bin/
+COPY --from=builder /out/pam_howdy.so /usr/lib/security/pam_howdy.so
+COPY --from=builder /out/public-key /opt/face-fixture/public-key
+COPY --from=builder --chown=rbw:rbw /out/home/ /home/rbw/
+COPY tests/face_smoke_pinentry.sh /usr/local/bin/face-smoke-pinentry
+COPY tests/face_setup_smoke.sh /usr/local/bin/face-setup-smoke
+RUN chmod 0755 /usr/local/bin/face-smoke-pinentry /usr/local/bin/face-setup-smoke \
+    && chmod 0644 /usr/lib/security/pam_howdy.so \
+    && printf '%s\n' 'face-smoke-synthetic-secret-8e8edc' >/opt/face-fixture/expected-secret
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/face-setup-smoke"]

@@ -97,9 +97,19 @@ pub struct Keys {
     keys: Vec,
 }
 
+pub const KEYS_LEN: usize = 64;
+
 impl Keys {
     pub fn new(keys: Vec) -> Self {
         Self { keys }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.keys.data()
+    }
+
+    pub(crate) fn zeroize(&mut self) {
+        self.keys.zero();
     }
 
     pub fn enc_key(&self) -> &[u8] {

@@ -68,7 +68,7 @@ pub fn socket_file() -> std::path::PathBuf {
 }
 
 pub fn ssh_agent_socket_file() -> std::path::PathBuf {
-    runtime_dir().join("ssh-agent-socket")
+    runtime_dir().join("ssh-agent.sock")
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -97,7 +97,7 @@ fn runtime_dir() -> std::path::PathBuf {
             format!(
                 "{}/{}-{}",
                 std::env::temp_dir().to_string_lossy(),
-                &profile(),
+                profile(),
                 rustix::process::getuid().as_raw()
             )
             .into()

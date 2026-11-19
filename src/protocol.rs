@@ -17,6 +17,18 @@ pub const VERSION: u32 = {
         + unwrap(&u32::from_str_radix(patch, 10)) * 1_000_000
 };
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
+pub struct AuthRequestInfo {
+    pub id: String,
+    pub fingerprint: String,
+    pub device_type: String,
+    pub ip_address: String,
+    pub country_name: Option<String>,
+    pub creation_date: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Request {
     tty: Option<String>,
@@ -171,6 +183,17 @@ pub enum Action {
     Login,
     Register,
     Unlock,
+    UnlockWithUserKey {
+        key: UserKeyMaterial,
+    },
+    UnlockWithDevice,
+    ListAuthRequests,
+    ApproveAuthRequest {
+        id: String,
+    },
+    RejectAuthRequest {
+        id: String,
+    },
     CheckLock,
     Lock,
     Sync,
@@ -190,12 +213,161 @@ pub enum Action {
     Version,
 }
 
+pub struct UserKeyMaterial([u8; crate::locked::KEYS_LEN]);
+
+impl UserKeyMaterial {
+    pub fn new(bytes: [u8; crate::locked::KEYS_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; crate::locked::KEYS_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for UserKeyMaterial {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str("UserKeyMaterial([REDACTED])")
+    }
+}
+
+impl serde::Serialize for UserKeyMaterial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Keep the User Key borrowed here: passing the array by value would
+        // create an avoidable plaintext key copy on the stack.
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        let encoded = crate::base64::encode(&self.0);
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UserKeyMaterial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let decoded = crate::base64::decode(&encoded)
+            .map_err(serde::de::Error::custom)?;
+        let bytes = decoded.try_into().map_err(|decoded: Vec<u8>| {
+            serde::de::Error::invalid_length(
+                decoded.len(),
+                &"a 64-byte Bitwarden User Key",
+            )
+        })?;
+        Ok(Self(bytes))
+    }
+}
+
+impl Drop for UserKeyMaterial {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Response {
     Ack,
+    DeviceAuthPending { id: String, fingerprint: String },
+    AuthRequests { requests: Vec<AuthRequestInfo> },
+    AuthRequestApproval { request: AuthRequestInfo },
     Error { error: String },
     Decrypt { plaintext: String },
     Encrypt { cipherstring: String },
     Version { version: u32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> AuthRequestInfo {
+        AuthRequestInfo {
+            id: "request-id".to_string(),
+            fingerprint: "one-two-three-four-five".to_string(),
+            device_type: "Linux Desktop".to_string(),
+            ip_address: "192.0.2.1".to_string(),
+            country_name: Some("Test".to_string()),
+            creation_date: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_request_ipc_contains_only_safe_metadata() {
+        let response = Response::AuthRequests {
+            requests: vec![info()],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("one-two-three-four-five"));
+        assert!(!json.contains("accessCode"));
+        assert!(!json.contains("privateKey"));
+        assert!(!json.contains("userKey"));
+        assert!(!json.contains("pam"));
+        assert!(!json.contains("localAuth"));
+        assert!(!json.contains("authenticated"));
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Response::AuthRequests { requests } => {
+                assert_eq!(requests, vec![info()]);
+            }
+            _ => panic!("wrong response variant"),
+        }
+    }
+
+    #[test]
+    fn approval_action_cannot_claim_local_authentication() {
+        assert_eq!(
+            serde_json::to_value(Action::ApproveAuthRequest {
+                id: "00000000-0000-0000-0000-000000000000".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "ApproveAuthRequest",
+                "id": "00000000-0000-0000-0000-000000000000",
+            }),
+        );
+    }
+
+    #[test]
+    fn raw_user_key_material_is_redacted_and_strictly_sized() {
+        let action = Action::UnlockWithUserKey {
+            key: UserKeyMaterial::new([0xabu8; crate::locked::KEYS_LEN]),
+        };
+        let debug = format!("{action:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("abab"));
+
+        let encoded = serde_json::to_value(&action).unwrap();
+        let decoded: Action = serde_json::from_value(encoded).unwrap();
+        match decoded {
+            Action::UnlockWithUserKey { key } => {
+                assert_eq!(
+                    key.as_bytes(),
+                    &[0xabu8; crate::locked::KEYS_LEN]
+                );
+            }
+            _ => panic!("wrong action variant"),
+        }
+        assert!(serde_json::from_value::<Action>(serde_json::json!({
+            "type": "UnlockWithUserKey",
+            "key": crate::base64::encode([0_u8; 63]),
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn device_unlock_action_has_no_key_material() {
+        assert_eq!(
+            serde_json::to_value(Action::UnlockWithDevice).unwrap(),
+            serde_json::json!({"type": "UnlockWithDevice"}),
+        );
+    }
 }

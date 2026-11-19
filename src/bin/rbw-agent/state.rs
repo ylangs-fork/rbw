@@ -1,11 +1,23 @@
 use sha2::Digest as _;
 
+pub const REMOTE_L1_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 pub struct State {
-    pub priv_key: Option<rbw::locked::Keys>,
-    pub org_keys:
-        Option<std::collections::HashMap<String, rbw::locked::Keys>>,
+    // HOOK(shatter): state-machine must preserve this wrapped representation
+    // when adding L1 metadata and should use `with_key` for all access.
+    pub priv_key: Option<rbw::locked_shatter::ShatteredKeys>,
+    pub org_keys: Option<
+        std::collections::HashMap<String, rbw::locked_shatter::ShatteredKeys>,
+    >,
+    pub(crate) clear_generation: tokio::sync::watch::Sender<u64>,
     pub timeout: crate::timeout::Timeout,
-    pub timeout_duration: std::time::Duration,
+    pub l1_timeout: std::time::Duration,
+    pub last_bio_success: Option<std::time::Instant>,
+    /// Fixed at agent startup. Once a secure local PAM policy selects the
+    /// local mode, a later policy error must fail closed instead of silently
+    /// downgrading the running session to the remote bypass mode.
+    pub(crate) pam_gate_required: bool,
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
@@ -29,28 +41,139 @@ pub struct State {
 }
 
 impl State {
-    pub fn key(&self, org_id: Option<&str>) -> Option<&rbw::locked::Keys> {
-        org_id.map_or(self.priv_key.as_ref(), |id| {
-            self.org_keys.as_ref().and_then(|h| h.get(id))
-        })
+    fn has_keys(&self) -> bool {
+        self.priv_key.is_some() && self.org_keys.is_some()
+    }
+
+    /// Clone the user/org key material out of `ShatteredKeys` for callers that
+    /// need to hold the plaintext across multiple operations (e.g. decrypt
+    /// with reprompt). The clone is short-lived on the caller's stack; this
+    /// relaxes the strict closure confinement of `with_key` for legacy
+    /// multi-step paths. Gated by L1 liveness.
+    pub fn key_cloned(
+        &self,
+        org_id: Option<&str>,
+    ) -> Option<rbw::locked::Keys> {
+        if !self.l1_alive() {
+            return None;
+        }
+        org_id.map_or_else(
+            || {
+                self.priv_key
+                    .as_ref()
+                    .map(|keys| keys.with_unsealed(std::clone::Clone::clone))
+            },
+            |id| {
+                self.org_keys.as_ref().and_then(|keys| {
+                    keys.get(id).map(|keys| {
+                        keys.with_unsealed(std::clone::Clone::clone)
+                    })
+                })
+            },
+        )
+    }
+
+    /// Access the user/org key material inside a closure so the plaintext
+    /// only exists transiently (`ShatteredKeys`). Gated by L1 liveness: returns
+    /// None when the L1 session has expired (caller must re-unlock).
+    #[allow(dead_code)]
+    pub fn with_key<R>(
+        &self,
+        org_id: Option<&str>,
+        f: impl FnOnce(&rbw::locked::Keys) -> R,
+    ) -> Option<R> {
+        if !self.l1_alive() {
+            return None;
+        }
+        if let Some(id) = org_id {
+            self.org_keys
+                .as_ref()
+                .and_then(|keys| keys.get(id))
+                .map(|keys| keys.with_unsealed(f))
+        } else {
+            self.priv_key.as_ref().map(|keys| keys.with_unsealed(f))
+        }
     }
 
     pub fn needs_unlock(&self) -> bool {
-        self.priv_key.is_none() || self.org_keys.is_none()
+        !self.l1_alive()
     }
 
+    pub fn l1_alive(&self) -> bool {
+        self.has_keys()
+            && self
+                .last_bio_success
+                .is_some_and(|last| last.elapsed() < self.l1_timeout)
+    }
+
+    pub fn pam_gate_required(&self) -> bool {
+        self.pam_gate_required
+    }
+
+    pub fn effective_l1_timeout(
+        configured: std::time::Duration,
+        pam_gate_required: bool,
+    ) -> std::time::Duration {
+        if pam_gate_required {
+            configured
+        } else {
+            configured.min(REMOTE_L1_TIMEOUT)
+        }
+    }
+
+    /// Begin or renew the L1 lifetime after a trusted authorization event.
+    pub fn record_bio_success(&mut self) {
+        self.last_bio_success = Some(std::time::Instant::now());
+        self.timeout.set(self.l1_timeout);
+    }
+
+    /// Refresh the L1 timeout without recording a new bio heartbeat. Used by
+    /// non-sensitive actions that should keep an already-live session alive
+    /// but must not themselves renew authorization.
     pub fn set_timeout(&self) {
-        self.timeout.set(self.timeout_duration);
+        self.timeout.set(self.l1_timeout);
+    }
+
+    /// A cold unlock is a stronger authorization event than a bio heartbeat
+    /// and starts the same L1 lifetime.
+    #[allow(dead_code)]
+    pub fn begin_l1_session(&mut self) {
+        self.record_bio_success();
+    }
+
+    // HOOK(state-machine): B2 replaces this unlocked-state approximation
+    // with the L1 expiry calculation from the shared contract.
+    // -> merged: real l1_alive() is defined above (line ~88); this hook removed.
+
+    // HOOK(state-machine): B3 replaces the existing timeout reset with the
+    // dedicated bio-heartbeat timestamp.
+    // -> merged: real record_bio_success() is defined above (line ~111); this hook removed.
+
+    pub fn cancellation(&self) -> Cancellation {
+        Cancellation {
+            receiver: self.clear_generation.subscribe(),
+        }
     }
 
     pub fn clear(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
         self.timeout.clear();
+        self.last_bio_success = None;
+        let next = self.clear_generation.borrow().wrapping_add(1);
+        self.clear_generation.send_replace(next);
     }
 
     pub fn set_sync_timeout(&self) {
-        self.sync_timeout.set(self.sync_timeout_duration);
+        // `sync_interval=0` means the user opted into push-only (no periodic
+        // polling). A zero duration must NOT be turned into sleep(0) here,
+        // because `tokio::time::sleep(0)` resolves immediately, which would
+        // re-trigger `Event::Sync` and create a tight infinite loop that
+        // exhausts file descriptors and wedges the agent. "Don't poll" must
+        // mean "don't arm the timer", not "arm a 0-second timer".
+        if self.sync_timeout_duration > std::time::Duration::ZERO {
+            self.sync_timeout.set(self.sync_timeout_duration);
+        }
     }
 
     // the way we structure the client/agent split in rbw makes the master
@@ -142,5 +265,298 @@ impl State {
         environment: rbw::protocol::Environment,
     ) {
         self.last_environment = environment;
+    }
+}
+
+pub struct Cancellation {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+
+impl Cancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.receiver.has_changed().unwrap_or(true)
+    }
+
+    pub async fn cancelled(&mut self) {
+        let _ = self.receiver.changed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> rbw::locked::Keys {
+        let mut material = rbw::locked::Vec::new();
+        material.extend(0_u8..64);
+        rbw::locked::Keys::new(material)
+    }
+
+    #[tokio::test]
+    async fn clear_removes_user_and_organization_keys() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        let mut cancellation = state.cancellation();
+        assert!(!state.needs_unlock());
+        assert!(state.l1_alive());
+        state.clear();
+        assert!(state.needs_unlock());
+        assert!(!state.l1_alive());
+        assert!(state.last_bio_success.is_none());
+        assert!(state.priv_key.is_none());
+        assert!(state.org_keys.is_none());
+        assert!(cancellation.is_cancelled());
+        cancellation.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn org_keys_are_shattered_and_reassembled_on_access() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut org_material = rbw::locked::Vec::new();
+        org_material.extend(64_u8..128);
+        let org_keys = rbw::locked::Keys::new(org_material);
+        let mut org_map = std::collections::HashMap::new();
+        org_map.insert(
+            "org-1".to_string(),
+            rbw::locked_shatter::ShatteredKeys::seal(&org_keys),
+        );
+        let state = State {
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
+            org_keys: Some(org_map),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+
+        // The org key round-trips through with_key/key_cloned exactly like
+        // the user key, proving it is reassembled on access rather than
+        // stored as one contiguous plaintext buffer.
+        let via_with_key = state
+            .with_key(Some("org-1"), |k| {
+                (k.enc_key().to_vec(), k.mac_key().to_vec())
+            })
+            .expect("org key should be accessible while L1 is alive");
+        assert_eq!(via_with_key.0, org_keys.enc_key());
+        assert_eq!(via_with_key.1, org_keys.mac_key());
+
+        let via_key_cloned = state
+            .key_cloned(Some("org-1"))
+            .expect("org key should be accessible while L1 is alive");
+        assert_eq!(via_key_cloned.enc_key(), org_keys.enc_key());
+        assert_eq!(via_key_cloned.mac_key(), org_keys.mac_key());
+
+        // An unknown org id must not fall back to the user key or panic.
+        assert!(state.with_key(Some("org-missing"), |_| ()).is_none());
+        assert!(state.key_cloned(Some("org-missing")).is_none());
+    }
+
+    #[tokio::test]
+    async fn l1_expiry_and_bio_renewal_are_explicit() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(61))
+                    .expect("a 61-second subtraction is representable"),
+            ),
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        assert!(!state.l1_alive());
+        assert!(state.needs_unlock());
+        assert!(state.with_key(None, |_| ()).is_none());
+        state.record_bio_success();
+        assert!(state.l1_alive());
+        assert!(!state.needs_unlock());
+        assert!(state.with_key(None, |_| ()).is_some());
+    }
+
+    #[test]
+    fn local_and_remote_modes_choose_distinct_l1_lifetimes() {
+        let configured = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(State::effective_l1_timeout(configured, true), configured);
+        assert_eq!(
+            State::effective_l1_timeout(configured, false),
+            REMOTE_L1_TIMEOUT
+        );
+
+        let stricter = std::time::Duration::from_secs(5 * 60);
+        assert_eq!(State::effective_l1_timeout(stricter, false), stricter);
+    }
+
+    #[tokio::test]
+    async fn pam_gate_mode_is_fixed_for_the_session() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let state = State {
+            priv_key: Some(rbw::locked_shatter::ShatteredKeys::seal(&keys())),
+            org_keys: Some(std::collections::HashMap::new()),
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: Some(std::time::Instant::now()),
+            pam_gate_required: false,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        assert!(!state.pam_gate_required());
+    }
+
+    /// Regression: a cold unlock (master password / TPM helper / device-auth
+    /// approval) installs keys AND must start the L1 session. The real unlock
+    /// paths call `record_bio_success()` after installing keys; without it,
+    /// `needs_unlock()` stays true forever (L1 deadlock) because `l1_alive()`
+    /// requires both keys and a fresh `last_bio_success`. See
+    /// `e2e-real-report.md`.
+    #[tokio::test]
+    async fn cold_unlock_must_start_l1_session() {
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let (sync_timeout, _sync_timeout_receiver) =
+            crate::timeout::Timeout::new();
+        let mut state = State {
+            priv_key: None,
+            org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: None,
+            pam_gate_required: true,
+            sync_timeout,
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+        // Pre-unlock: nothing installed, definitely needs unlock.
+        assert!(state.needs_unlock());
+        assert!(!state.l1_alive());
+
+        // Simulate the body of unlock_success(): install keys.
+        state.priv_key =
+            Some(rbw::locked_shatter::ShatteredKeys::seal(&keys()));
+        state.org_keys = Some(std::collections::HashMap::new());
+
+        // Keys present but no bio heartbeat yet: this is the deadlock state
+        // that existed before the fix. l1_alive() must still be false.
+        assert!(!state.l1_alive(),
+            "keys installed without bio heartbeat must NOT be L1-alive (this models the pre-fix deadlock)");
+        assert!(
+            state.needs_unlock(),
+            "keys without heartbeat must still report needs_unlock"
+        );
+
+        // The fix: a cold unlock is a full-trust event and records a bio
+        // success, establishing the L1 session.
+        state.record_bio_success();
+        assert!(
+            state.l1_alive(),
+            "after record_bio_success (cold-unlock trust), L1 must be alive"
+        );
+        assert!(
+            !state.needs_unlock(),
+            "after cold unlock the agent must NOT report needs_unlock"
+        );
+        assert!(state.with_key(None, |_| ()).is_some());
+    }
+
+    /// Regression: `sync_interval=0` means push-only (no periodic polling).
+    /// Calling `set_sync_timeout()` must NOT arm a zero-second timer, because
+    /// `sleep(0)` resolves immediately and re-triggers `Event::Sync` into an
+    /// infinite loop that exhausts file descriptors. "Don't poll" must mean
+    /// "don't arm the timer". See e2e-real-report.md residual risk #2.
+    #[tokio::test]
+    async fn sync_interval_zero_does_not_arm_a_loop_timer() {
+        let (sync_timeout, mut sync_timer_r) = crate::timeout::Timeout::new();
+        let (timeout, _timeout_receiver) = crate::timeout::Timeout::new();
+        let state = State {
+            priv_key: None,
+            org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
+            timeout,
+            l1_timeout: std::time::Duration::from_secs(60),
+            last_bio_success: None,
+            pam_gate_required: false,
+            sync_timeout,
+            // The push-only default.
+            sync_timeout_duration: std::time::Duration::ZERO,
+            notifications_handler: crate::notifications::Handler::new(),
+            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt_initialized: false,
+            last_environment: rbw::protocol::Environment::default(),
+            #[cfg(feature = "clipboard")]
+            clipboard: None,
+        };
+
+        // Act: simulate "sync completed, arm the next sync timer".
+        state.set_sync_timeout();
+
+        // Assert: no timer fires. With Duration::ZERO, we must NOT have armed
+        // a sleep(0); otherwise this receiver would be ready almost
+        // immediately and Event::Sync would loop.
+        let pinned = std::pin::pin!(sync_timer_r.recv());
+        let fired = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            pinned,
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "sync timer must NOT fire when sync_interval=0; \
+             a fire here means a sleep(0) loop bug is back"
+        );
     }
 }

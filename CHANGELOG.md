@@ -1,5 +1,67 @@
 # Changelog
 
+## [1.16.0] - 2026-11-19
+
+## Added
+
+* Added native Login with device support, including manual local-authentication-gated
+  approval and rejection of authentication requests. Pending requests can be
+  selected by list number or request ID; the ID can be omitted when only one
+  request is pending.
+* Added `rbw setup` with read-only preflight and explicit `--apply` installation
+  of a dedicated Howdy face-authorization policy on GNU/Linux. Native Howdy is
+  the sole supported biometric setup backend; sudo/login policies and the
+  Master Password cold-unlock path are unchanged.
+* Added an isolated no-hardware face smoke using real CLI/agent/PAM flows and
+  synthetic test-only face decisions. This is not a real-camera validation.
+* Added an optional `unlock_helper` configuration field. When set, the
+  configured command is invoked (with an empty environment, no stdin, and a
+  30-second timeout) during `rbw unlock` before pinentry is consulted. The
+  helper must print `OK <hex>` (optionally followed by a newline) where
+  `<hex>` decodes to exactly 64 bytes. Any failure (spawn error, non-zero
+  exit, timeout, malformed output, wrong length) prints one short generic
+  message to stderr and falls back to the pinentry-based unlock. Configure
+  with `rbw config set unlock_helper <cmd>`, clear with
+  `rbw config unset unlock_helper` or `rbw config set unlock_helper ""`.
+* Added a built-in read-only `ssh-agent` protocol service (opt-in via
+  `rbw config set ssh_agent.enabled true`) so OpenSSH, Git, and compatible
+  tools can sign with vault-backed SSH keys without writing them to disk.
+  Signing can be gated per-key by OpenSSH fingerprint with `always` (fresh
+  PAM authorization per signature, fails closed if no PAM policy is
+  configured), `l1` (default; requires the agent to already be unlocked, PAM
+  fallback otherwise), or `never` (no additional gate). Includes a worked
+  example for wiring `sudo` to the same agent via the distribution's
+  `pam_ssh_agent_auth` module, with the existing password prompt retained as
+  a fallback.
+* Added in-memory hardening for the decrypted User Key: it is now kept as
+  four independently allocated, XOR-split shares (`ShatteredKeys`) instead of
+  one contiguous plaintext buffer, and is only reassembled for the duration
+  of a single use before being zeroized again. A `memory_guard` ptrace
+  sentinel process also watches the agent's `TracerPid` and clears all key
+  material if the agent is unexpectedly attached to or the sentinel is
+  killed. This raises the cost of generic memory-scanning tools that look
+  for a contiguous key-shaped value; it is not a boundary against an
+  attacker who knows the layout and can read the process, including direct
+  `/proc/<pid>/mem` access that does not change `TracerPid`.
+* Decrypted entry secrets (`rbw get` output, SSH agent responses) are now
+  held in a self-zeroizing buffer inside the agent process instead of a
+  plain `String`, reducing how long plaintext may remain resident in the
+  agent's memory after use.
+
+## Changed
+
+* Replaced request-driven key timeout renewal with explicit L0/L1 sessions.
+  Local agents require fresh dedicated-PAM authorization for secret reads and
+  renew `l1_timeout` only after successful authorization. Agents started
+  without a secure PAM policy use a non-renewable session capped at ten
+  minutes. See the README's "Local authorization sessions" section for
+  details.
+
+## Fixed
+
+* Locking an agent now cancels a pending secret-access PAM authorization and
+  prevents its late result from renewing a subsequently unlocked session.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added

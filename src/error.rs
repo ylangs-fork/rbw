@@ -24,6 +24,9 @@ pub enum Error {
     #[error("failed to decrypt")]
     Decrypt { source: block_padding::UnpadError },
 
+    #[error("device authentication failed: {message}")]
+    DeviceAuth { message: String },
+
     #[error("failed to find free port in {range}")]
     FailedToFindFreePort { range: String },
 
@@ -112,6 +115,9 @@ pub enum Error {
         file: std::path::PathBuf,
     },
 
+    #[error("this device is not registered with the server; run `rbw login` once before using Login with device")]
+    KnownDeviceRequired,
+
     #[error("failed to load db from {}", .file.display())]
     LoadDb {
         source: std::io::Error,
@@ -177,6 +183,9 @@ pub enum Error {
         source: std::io::Error,
         file: std::path::PathBuf,
     },
+
+    #[error("auth request was rejected, expired, or is unavailable")]
+    AuthRequestUnavailable,
 
     #[error("api request returned error: {status}")]
     RequestFailed { status: u16 },

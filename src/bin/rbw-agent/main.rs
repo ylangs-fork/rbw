@@ -4,6 +4,8 @@ mod actions;
 mod agent;
 mod daemon;
 mod debugger;
+mod local_auth;
+mod memory_guard;
 mod notifications;
 mod sock;
 mod ssh_agent;
@@ -12,6 +14,8 @@ mod timeout;
 
 async fn tokio_main(
     startup_ack: Option<crate::daemon::StartupAck>,
+    memory_guard: crate::memory_guard::MemoryGuard,
+    sentinel_exit: Option<std::sync::mpsc::Receiver<()>>,
 ) -> anyhow::Result<()> {
     let listener = crate::sock::listen()?;
 
@@ -20,8 +24,16 @@ async fn tokio_main(
     }
 
     let config = rbw::config::Config::load()?;
-    let timeout_duration =
-        std::time::Duration::from_secs(config.lock_timeout);
+    let configured_l1_timeout =
+        std::time::Duration::from_secs(config.l1_timeout);
+    // The local/remote shape is fixed for this agent process. A local agent
+    // must fail closed if its policy later becomes unavailable; it must not
+    // silently turn into a remote-mode bypass until the next restart.
+    let pam_gate_required = rbw::pam_gate::PamGate::detect().is_some();
+    let l1_timeout = crate::state::State::effective_l1_timeout(
+        configured_l1_timeout,
+        pam_gate_required,
+    );
     let sync_timeout_duration =
         std::time::Duration::from_secs(config.sync_interval);
     let (timeout, timer_r) = crate::timeout::Timeout::new();
@@ -34,8 +46,11 @@ async fn tokio_main(
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::state::State {
             priv_key: None,
             org_keys: None,
+            clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
-            timeout_duration,
+            l1_timeout,
+            last_bio_success: None,
+            pam_gate_required,
             sync_timeout,
             sync_timeout_duration,
             notifications_handler,
@@ -50,12 +65,22 @@ async fn tokio_main(
                 .ok(),
         }));
 
-    let agent =
-        crate::agent::Agent::new(timer_r, sync_timer_r, state.clone());
+    memory_guard.spawn_watchdogs(state.clone(), sentinel_exit);
+    let agent = crate::agent::Agent::new(
+        timer_r,
+        sync_timer_r,
+        state.clone(),
+        memory_guard,
+    );
 
-    let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
-
-    tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    if config.ssh_agent.enabled {
+        let ssh_agent =
+            crate::ssh_agent::SshAgent::new(state.clone(), config.ssh_agent);
+        tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    } else {
+        crate::ssh_agent::remove_stale_socket()?;
+        agent.run(listener).await?;
+    }
 
     Ok(())
 }
@@ -75,6 +100,18 @@ fn real_main() -> anyhow::Result<()> {
     let startup_ack =
         daemon::daemonize(no_daemonize).context("failed to daemonize")?;
 
+    let (memory_guard, sentinel_exit) =
+        match crate::memory_guard::start_sentinel() {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::warn!(
+                    "failed to start ptrace sentinel; continuing with \
+                     TracerPid monitoring only: {error:#}"
+                );
+                (crate::memory_guard::MemoryGuard::default(), None)
+            }
+        };
+
     if let Err(e) = debugger::disable_tracing() {
         log::warn!("{e}");
     }
@@ -85,7 +122,9 @@ fn real_main() -> anyhow::Result<()> {
     // unwrap is fine here because there's no good reason that this should
     // ever fail
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        if let Err(e) = tokio_main(startup_ack).await {
+        if let Err(e) =
+            tokio_main(startup_ack, memory_guard, sentinel_exit).await
+        {
             // this unwrap is fine because it's the only real option here
             w.send(e).unwrap();
         }
@@ -99,6 +138,13 @@ fn real_main() -> anyhow::Result<()> {
 }
 
 fn main() {
+    if crate::memory_guard::sentinel_requested() {
+        std::process::exit(i32::from(!crate::memory_guard::run_sentinel()));
+    }
+    if crate::local_auth::helper_requested() {
+        std::process::exit(i32::from(!crate::local_auth::run_helper()));
+    }
+
     let res = real_main();
 
     if let Err(e) = res {

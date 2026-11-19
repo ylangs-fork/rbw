@@ -61,6 +61,146 @@ pub async fn login(
     ))
 }
 
+pub async fn create_auth_request(
+    email: &str,
+    public_key: &str,
+    access_code: &str,
+) -> Result<crate::api::AuthRequest> {
+    let (client, config) = api_client_async().await?;
+    client
+        .create_auth_request(
+            email,
+            &crate::config::registered_device_id(&config).await?,
+            public_key,
+            access_code,
+        )
+        .await
+}
+
+pub async fn get_auth_request_response(
+    request_id: &str,
+    access_code: &str,
+) -> Result<crate::api::AuthRequest> {
+    let (client, _) = api_client_async().await?;
+    client
+        .get_auth_request_response(request_id, access_code)
+        .await
+}
+
+pub async fn login_with_auth_request(
+    email: &str,
+    access_code: &str,
+    request_id: &str,
+    two_factor_token: Option<&str>,
+    two_factor_provider: Option<crate::api::TwoFactorProviderType>,
+) -> Result<(
+    String,
+    String,
+    crate::api::KdfType,
+    u32,
+    Option<u32>,
+    Option<u32>,
+    String,
+)> {
+    let (client, config) = api_client_async().await?;
+    let (kdf, iterations, memory, parallelism) =
+        client.prelogin(email).await?;
+    let (access_token, refresh_token, protected_key) = client
+        .login_with_auth_request(
+            email,
+            &crate::config::registered_device_id(&config).await?,
+            access_code,
+            request_id,
+            two_factor_token,
+            two_factor_provider,
+        )
+        .await?;
+    Ok((
+        access_token,
+        refresh_token,
+        kdf,
+        iterations,
+        memory,
+        parallelism,
+        protected_key,
+    ))
+}
+
+pub async fn pending_auth_requests(
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(Option<String>, Vec<crate::api::AuthRequest>)> {
+    let (client, _) = api_client_async().await?;
+    match client.pending_auth_requests(access_token).await {
+        Ok(requests) => Ok((None, requests)),
+        Err(Error::RequestUnauthorized) => {
+            let access_token =
+                exchange_refresh_token_async(refresh_token).await?;
+            let requests =
+                client.pending_auth_requests(&access_token).await?;
+            Ok((Some(access_token), requests))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn get_auth_request(
+    access_token: &str,
+    refresh_token: &str,
+    request_id: &str,
+) -> Result<(Option<String>, crate::api::AuthRequest)> {
+    let (client, _) = api_client_async().await?;
+    match client.get_auth_request(access_token, request_id).await {
+        Ok(request) => Ok((None, request)),
+        Err(Error::RequestUnauthorized) => {
+            let access_token =
+                exchange_refresh_token_async(refresh_token).await?;
+            let request =
+                client.get_auth_request(&access_token, request_id).await?;
+            Ok((Some(access_token), request))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn update_auth_request(
+    access_token: &str,
+    refresh_token: &str,
+    request_id: &str,
+    key: &str,
+    approved: bool,
+) -> Result<(Option<String>, crate::api::AuthRequest)> {
+    let (client, config) = api_client_async().await?;
+    let device_id = crate::config::registered_device_id(&config).await?;
+    match client
+        .update_auth_request(
+            access_token,
+            request_id,
+            &device_id,
+            key,
+            approved,
+        )
+        .await
+    {
+        Ok(request) => Ok((None, request)),
+        Err(Error::RequestUnauthorized) => {
+            let access_token =
+                exchange_refresh_token_async(refresh_token).await?;
+            let request = client
+                .update_auth_request(
+                    &access_token,
+                    request_id,
+                    &device_id,
+                    key,
+                    approved,
+                )
+                .await?;
+            Ok((Some(access_token), request))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn send_two_factor_email(
     email: &str,
     sso_email_2fa_session_token: &str,
@@ -110,24 +250,29 @@ pub fn unlock<S: std::hash::BuildHasher>(
         Err(e) => return Err(e),
     };
 
+    unlock_with_user_key(key, protected_private_key, protected_org_keys)
+}
+
+pub fn unlock_with_user_key<S: std::hash::BuildHasher>(
+    key: crate::locked::Keys,
+    protected_private_key: &str,
+    protected_org_keys: &std::collections::HashMap<String, String, S>,
+) -> Result<(
+    crate::locked::Keys,
+    std::collections::HashMap<String, crate::locked::Keys>,
+)> {
     let protected_private_key =
         crate::cipherstring::CipherString::new(protected_private_key)?;
-    let private_key =
-        match protected_private_key.decrypt_locked_symmetric(&key) {
-            Ok(private_key) => crate::locked::PrivateKey::new(private_key),
-            Err(e) => return Err(e),
-        };
+    let private_key = crate::locked::PrivateKey::new(
+        protected_private_key.decrypt_locked_symmetric(&key)?,
+    );
 
     let mut org_keys = std::collections::HashMap::new();
     for (org_id, protected_org_key) in protected_org_keys {
-        let protected_org_key =
-            crate::cipherstring::CipherString::new(protected_org_key)?;
         let org_key =
-            match protected_org_key.decrypt_locked_asymmetric(&private_key) {
-                Ok(org_key) => crate::locked::Keys::new(org_key),
-                Err(e) => return Err(e),
-            };
-        org_keys.insert(org_id.clone(), org_key);
+            crate::cipherstring::CipherString::new(protected_org_key)?
+                .decrypt_locked_asymmetric_der(&private_key)?;
+        org_keys.insert(org_id.clone(), crate::locked::Keys::new(org_key));
     }
 
     Ok((key, org_keys))
@@ -367,4 +512,59 @@ async fn api_client_async(
         config.client_cert_path(),
     );
     Ok((client, config))
+}
+
+#[cfg(test)]
+mod device_auth_unlock_tests {
+    use rsa::pkcs8::EncodePrivateKey as _;
+
+    use super::*;
+
+    #[test]
+    fn unlock_with_user_key_decrypts_organization_key_from_unpadded_der() {
+        let mut user_material = crate::locked::Vec::new();
+        user_material
+            .extend(0_u8..u8::try_from(crate::locked::KEYS_LEN).unwrap());
+        let user_key = crate::locked::Keys::new(user_material);
+
+        let private_key =
+            rsa::RsaPrivateKey::new(&mut rand_8::rngs::OsRng, 2048)
+                .expect("RSA key generation succeeds");
+        let private_key_der = private_key
+            .to_pkcs8_der()
+            .expect("PKCS#8 encoding succeeds");
+        let protected_private_key =
+            crate::cipherstring::CipherString::encrypt_symmetric(
+                &user_key,
+                private_key_der.as_bytes(),
+            )
+            .expect("private-key protection succeeds")
+            .to_string();
+
+        let expected_org_key = [0x5a_u8; crate::locked::KEYS_LEN];
+        let encrypted_org_key = rsa::RsaPublicKey::from(&private_key)
+            .encrypt(
+                &mut rand_8::rngs::OsRng,
+                rsa::Oaep::new::<sha1::Sha1>(),
+                &expected_org_key,
+            )
+            .expect("organization-key protection succeeds");
+        let protected_org_keys = std::collections::HashMap::from([(
+            "organization-id".to_string(),
+            format!("4.{}", crate::base64::encode(encrypted_org_key)),
+        )]);
+
+        let (unlocked_user_key, org_keys) = unlock_with_user_key(
+            user_key,
+            &protected_private_key,
+            &protected_org_keys,
+        )
+        .expect("organization vault unlock succeeds");
+
+        assert_eq!(
+            unlocked_user_key.as_bytes().len(),
+            crate::locked::KEYS_LEN
+        );
+        assert_eq!(org_keys["organization-id"].as_bytes(), expected_org_key);
+    }
 }
