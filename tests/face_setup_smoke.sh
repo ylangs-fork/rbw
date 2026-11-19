@@ -1,7 +1,7 @@
 #!/bin/bash
 # Docker-only, offline, synthetic-data smoke. No camera/hardware assurance.
 # docker build --progress=plain -f tests/Dockerfile.face-smoke -t rbw-face-smoke .
-# docker run --rm --network none rbw-face-smoke
+# docker run --rm --network none --mount type=bind,src=/absolute/face-runtime.tar.gz,dst=/input/face-runtime.tar.gz,readonly rbw-face-smoke
 set -euo pipefail
 
 fail() { printf 'face smoke failed: %s\n' "$*" >&2; exit 1; }
@@ -9,6 +9,7 @@ fail() { printf 'face smoke failed: %s\n' "$*" >&2; exit 1; }
 [[ $(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n') == lo ]] || fail 'run with --network none'
 export HOME=/home/rbw RBW_PROFILE=face-smoke XDG_RUNTIME_DIR=/tmp/face-smoke-runtime
 export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/rbw-face-smoke/ssh-agent.sock"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 policy=/etc/pam.d/rbw-device-auth
 module=/usr/lib/security/pam_howdy.so
 fixture=/opt/face-fixture
@@ -22,10 +23,15 @@ printf 'deny\n' >"$control/pinentry"
 chmod 0644 "$control/result" "$control/pinentry"
 touch "$control/events" "$control/pinentry-events"
 chmod 0622 "$control/events" "$control/pinentry-events"
+printf 'allow\n' >"$control/notification-result"
+chmod 0644 "$control/notification-result"
+touch "$control/notifications"
+chmod 0622 "$control/notifications"
 
 user() {
     runuser -u rbw -- env HOME="$HOME" RBW_PROFILE="$RBW_PROFILE" \
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" "$@"
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" "$@"
 }
 stop_agent() {
     if [[ -n ${agent_pid:-} ]]; then
@@ -38,6 +44,8 @@ stop_agent() {
 cleanup() {
     if [[ -n ${request_pid:-} ]]; then kill "$request_pid" 2>/dev/null || true; fi
     stop_agent
+    if [[ -n ${notify_pid:-} ]]; then kill "$notify_pid" 2>/dev/null || true; wait "$notify_pid" 2>/dev/null || true; fi
+    if [[ -n ${bus_pid:-} ]]; then kill "$bus_pid" 2>/dev/null || true; fi
     # Plaintext is never retained or included in failure diagnostics.
     rm -rf "$work"
 }
@@ -103,11 +111,58 @@ system_pam_snapshot() {
     find /etc/pam.d -maxdepth 1 -type f ! -name rbw-device-auth -exec sha256sum '{}' + | sort
 }
 
+user dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork \
+    --print-pid=1 >"$work/bus.pid"
+bus_pid=$(cat "$work/bus.pid")
+user python3 /usr/local/bin/face-smoke-notifications "$work/notify.ready" \
+    >"$work/notifications.log" 2>&1 &
+notify_pid=$!
+for _ in {1..100}; do
+    [[ -f $work/notify.ready ]] && break
+    kill -0 "$notify_pid" 2>/dev/null || fail 'test notification service exited'
+    sleep 0.05
+done
+[[ -f $work/notify.ready ]] || fail 'notification service did not become ready'
+
 [[ ! -e $policy ]] || fail 'test image unexpectedly has an existing rbw policy'
 system_pam_snapshot >"$work/system-pam.before"
+
+# Login UX uses the actual CLI over a PTY and the already-authenticated offline vault.
+for choice in default no; do
+    python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config.pop('face_auth', None)
+path.write_text(json.dumps(config))
+PY
+    user python3 /usr/local/bin/face-smoke-onboarding "$choice"
+    python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert json.loads(pathlib.Path(sys.argv[1]).read_text())['face_auth'] is False
+PY
+    user python3 /usr/local/bin/face-smoke-onboarding quiet
+    user timeout 5 rbw stop-agent
+done
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config.pop('face_auth', None)
+path.write_text(json.dumps(config))
+PY
+user timeout 5 rbw login </dev/null >"$work/noninteractive.out" 2>"$work/noninteractive.err"
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
+PY
+user timeout 5 rbw stop-agent
+[[ $(event_count) == 0 ]] || fail 'declining login enrollment attempted face authentication'
+[[ $(wc -l <"$control/notifications") == 0 ]] || fail 'declining login enrollment delivered a face notification'
+printf 'face smoke: interactive login defaults to No, persists decline once, and never prompts in pipelines passed\n'
 expect_failure control-write user test -w "$control/result"
 
-# Setup never silently installs Howdy, requests auth, or overwrites a stranger.
+# Read-only diagnostics and noninteractive apply never mutate the system.
 mv "$module" "$fixture/hidden-pam_howdy.so"
 expect_failure missing-check rbw setup --check
 expect_failure missing-default rbw setup
@@ -119,7 +174,35 @@ expect_failure readonly-default user rbw setup
 expect_failure unprivileged-apply user rbw setup --apply
 [[ ! -e $policy ]] || fail 'readonly/unprivileged setup wrote a policy'
 [[ $(event_count) == 0 ]] || fail 'setup attempted authentication'
-rbw setup --apply >"$work/apply.out" 2>"$work/apply.err"
+# Trusted preconfigured backend, only inside this synthetic image. /dev/null is
+# a character-device fixture; real recognition remains the native test module.
+install -d -o root -g root -m 0755 /etc/howdy/models
+printf '[video]\ndevice_path = /dev/null\n' >/etc/howdy/config.ini
+printf 'synthetic model; test module supplies the decision\n' >/etc/howdy/models/rbw.dat
+chmod 0644 /etc/howdy/config.ini /etc/howdy/models/rbw.dat
+printf 'rbw ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/face-smoke
+chmod 0440 /etc/sudoers.d/face-smoke
+printf 'deny\n' >"$control/notification-result"
+user python3 /usr/local/bin/face-smoke-onboarding yes-failed
+[[ ! -e $policy ]] || fail 'failed enrollment left a newly enabled policy'
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
+PY
+printf 'allow\n' >"$control/notification-result"
+printf 'allow\n' >"$control/pinentry"
+user timeout 10 rbw unlock >"$work/pre-enrollment-unlock.out" 2>"$work/pre-enrollment-unlock.err"
+printf 'deny\n' >"$control/pinentry"
+pinentry_before=$(wc -l <"$control/pinentry-events")
+user python3 /usr/local/bin/face-smoke-onboarding yes
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert json.loads(pathlib.Path(sys.argv[1]).read_text())['face_auth'] is True
+PY
+user timeout 5 rbw unlocked
+[[ $(wc -l <"$control/pinentry-events") == "$pinentry_before" ]] || fail 'enrollment lost the unlocked session or prompted for the master password again'
+user python3 /usr/local/bin/face-smoke-onboarding quiet
+user timeout 5 rbw stop-agent
 [[ -f $policy && ! -L $policy ]] || fail 'setup did not install a regular policy'
 [[ $(stat -c '%u:%a' "$policy") == 0:644 ]] || fail 'policy is not root-owned mode 0644'
 python3 - "$policy" "$module" <<'PY'
@@ -137,25 +220,31 @@ assert all(line.startswith('#') or not line or line.split() in auth + account fo
 PY
 cp "$policy" "$work/managed-policy"
 policy_stat=$(stat -c '%i:%Y:%Z' "$policy")
-rbw setup --apply >"$work/apply-again.out" 2>"$work/apply-again.err"
+user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
 cmp -s "$policy" "$work/managed-policy" || fail 'second apply changed policy content'
 [[ $(stat -c '%i:%Y:%Z' "$policy") == "$policy_stat" ]] || fail 'idempotent apply replaced the policy'
 user rbw setup --check >"$work/check.out" 2>"$work/check.err"
 user rbw setup >"$work/default.out" 2>"$work/default.err"
 printf '# Foreign policy: must not overwrite\nauth required pam_deny.so\n' >"$policy"
 cp "$policy" "$work/foreign-policy"
-expect_failure foreign-apply rbw setup --apply
+expect_failure foreign-apply user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
 expect_failure foreign-check rbw setup --check
 cmp -s "$policy" "$work/foreign-policy" || fail 'foreign policy was overwritten'
 install -o root -g root -m 0644 "$work/managed-policy" "$policy"
 printf 'face smoke: readonly, missing-module, privileged apply, idempotence, foreign-policy protection passed\n'
+user timeout 5 rbw stop-agent
 
 # Eight-second local L1. Successful authorization renews; failures and aborts do not.
+pinentry_before=$(wc -l <"$control/pinentry-events")
 start_agent
 cold_unlock
-[[ $(wc -l <"$control/pinentry-events") == 1 ]] || fail 'cold unlock did not use the synthetic master-password prompt exactly once'
+[[ $(wc -l <"$control/pinentry-events") == $((pinentry_before + 1)) ]] || fail 'cold unlock did not use the synthetic master-password prompt exactly once'
 set_result success
 get_secret
+[[ $(wc -l <"$control/notifications") -gt 0 ]] || fail 'secret access delivered no desktop notification'
+printf 'deny\n' >"$control/notification-result"
+denied_get rejected-notification
+printf 'allow\n' >"$control/notification-result"
 original=$(now)
 until_time "$original" 5
 get_secret
@@ -165,8 +254,10 @@ user timeout 5 rbw unlocked >"$work/renewed.out" 2>"$work/renewed.err"
 for outcome in auth_err abort; do
     set_result "$outcome"
     before=$(event_count)
+    notified=$(wc -l <"$control/notifications")
     denied_get "face-$outcome"
     [[ $(event_count) -gt $before ]] || fail "$outcome did not reach real system PAM"
+    [[ $(wc -l <"$control/notifications") -gt $notified ]] || fail "$outcome authorization delivered no notification"
 done
 until_time "$renewed" 9
 expect_failure local-expired user timeout 5 rbw unlocked
@@ -246,6 +337,7 @@ import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 config = json.loads(path.read_text())
 config['l1_timeout'] = 6
+config.pop('face_auth', None)
 path.write_text(json.dumps(config))
 PY
 start_agent
@@ -262,6 +354,85 @@ expect_failure remote-expired user timeout 5 rbw unlocked
 denied_get remote-expired-get
 [[ $(event_count) == "$before" ]] || fail 'remote requests unexpectedly reached PAM'
 stop_agent
+
+# Explicit enable must not downgrade to remote after a restart with no policy.
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config['face_auth'] = True
+path.write_text(json.dumps(config))
+PY
+start_agent
+cold_unlock
+denied_get enabled-missing-policy
+stop_agent
+
+# Declining means normal idle locking, regardless of a machine-wide face policy.
+install -o root -g root -m 0644 "$work/managed-policy" "$policy"
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config['face_auth'] = False
+config['lock_timeout'] = 4
+path.write_text(json.dumps(config))
+PY
+start_agent
+cold_unlock
+before=$(event_count)
+notified=$(wc -l <"$control/notifications")
+ordinary=$(now)
+set_result auth_err
+get_secret
+until_time "$ordinary" 2
+get_secret
+until_time "$ordinary" 5
+get_secret
+[[ $(event_count) == "$before" ]] || fail 'declined face reached PAM'
+[[ $(wc -l <"$control/notifications") == "$notified" ]] || fail 'declined face emitted an authorization notification'
+sleep 5
+expect_failure ordinary-expired user timeout 5 rbw unlocked
+stop_agent
+printf 'face smoke: notification denial fails closed; explicit enable survives policy loss; decline restores normal idle renewal without face notifications passed\n'
+
+# The shipped artifact is a test input, never a simulator or production switch.
+# No compiler/package resolver is available during real offline deployment.
+[[ -f /input/face-runtime.tar.gz ]] || fail 'mount the published precompiled face runtime at /input/face-runtime.tar.gz'
+rm "$policy" "$module"
+rm -rf /etc/howdy
+install -d /usr/local/libexec
+printf 'corrupt archive fixture\n' >/usr/local/libexec/face-runtime.tar.gz
+chown rbw:rbw /usr/local/libexec/face-runtime.tar.gz
+mv /usr/bin/apt-get "$fixture/apt-get-disabled"
+! command -v cc >/dev/null || fail 'runtime test image unexpectedly contains a compiler'
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config.pop('face_auth', None)
+path.write_text(json.dumps(config))
+PY
+user python3 /usr/local/bin/face-smoke-onboarding yes-failed
+[[ ! -e /usr/lib/security/rbw-howdy ]] || fail 'corrupt archive was privileged-extracted'
+cp /input/face-runtime.tar.gz /usr/local/libexec/face-runtime.tar.gz
+chown rbw:rbw /usr/local/libexec/face-runtime.tar.gz
+user python3 /usr/local/bin/face-smoke-onboarding yes-failed
+[[ -f /usr/lib/security/rbw-howdy/pam_howdy.so ]] || fail 'valid precompiled runtime was not deployed'
+[[ ! -e /etc/rbw-howdy ]] || fail 'no-camera failure did not remove newly created enrollment configuration'
+[[ ! -e $policy ]] || fail 'no-camera enrollment enabled a policy'
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
+PY
+identity_stat=$(stat -c '%i:%Y:%Z' /usr/lib/security/rbw-howdy/.rbw-bundle-sha256)
+user python3 /usr/local/bin/face-smoke-onboarding yes-failed
+[[ $(stat -c '%i:%Y:%Z' /usr/lib/security/rbw-howdy/.rbw-bundle-sha256) == "$identity_stat" ]] || fail 'repeated deployment replaced the matching runtime'
+user timeout 5 rbw stop-agent
+notified=$(wc -l <"$control/notifications")
+user /usr/lib/security/rbw-howdy/runtime/bin/notify-send -- 'rbw package smoke' 'Published native notification runtime'
+[[ $(wc -l <"$control/notifications") -gt $notified ]] || fail 'bundled notification executable did not reach the real session bus'
+printf 'face smoke: published runtime deploys offline without system Python dependencies, rejects corrupt archives, and rolls back absent-camera enrollment passed\n'
 if pgrep -u rbw -f -- '--local-auth-helper' >/dev/null; then fail 'a local-auth helper survived teardown'; fi
 system_pam_snapshot >"$work/system-pam.after"
 cmp -s "$work/system-pam.before" "$work/system-pam.after" || fail 'setup changed another system PAM service'

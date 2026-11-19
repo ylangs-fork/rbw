@@ -145,6 +145,11 @@ async fn handle_request(
         rbw::protocol::Action::Login => {
             crate::actions::login(sock, state.clone(), &environment).await?;
         }
+        rbw::protocol::Action::ReloadSessionConfig => {
+            let config = rbw::config::Config::load_async().await?;
+            state.lock().await.reload_session_config(&config);
+            sock.send(&rbw::protocol::Response::Ack).await?;
+        }
         rbw::protocol::Action::Unlock => {
             crate::actions::unlock(sock, state.clone(), &environment).await?;
         }
@@ -226,6 +231,7 @@ async fn handle_request(
     }
 
     let mut state = state.lock().await;
+    state.record_activity();
     state.set_last_environment(environment);
 
     Ok(())

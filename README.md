@@ -97,14 +97,18 @@ configuration options:
 * `notifications_url`: The URL of the Bitwarden notifications server to use.
   If unset, will use the `/notifications` path on the configured `base_url`,
   or `https://notifications.bitwarden.com/` if no `base_url` is set.
-* `lock_timeout`: Legacy setting retained for configuration compatibility. The
-  L0/L1 session lifetime is governed by `l1_timeout`.
+* `lock_timeout`: Idle timeout in seconds for ordinary rbw sessions when face
+  authorization has been explicitly declined. Successful requests renew it.
 * `l1_timeout`: The maximum number of seconds that an unlocked L1 session can
   keep User Key material in the agent. Defaults to `86400` (24 hours). On a
   machine without a secure `/etc/pam.d/rbw-device-auth` policy at agent
   startup, the effective lifetime is capped at 600 seconds and is never
   renewed by ordinary requests. On a machine with that policy, each successful
   PAM authorization renews the configured lifetime.
+* `face_auth`: Enrollment decision recorded by the login wizard. `false` uses
+  ordinary rbw sessions; `true` requires face authorization even if the PAM
+  policy is later removed. An absent value leaves existing installations in
+  their previous auto-detected local/remote mode until interactive onboarding.
 * `sync_interval`: `rbw` will automatically sync the database from the server
   at an interval of this many seconds, while the agent is running. Setting
   this value to `0` disables this behavior. Defaults to `3600` (one hour).
@@ -143,48 +147,50 @@ When L1 expires, `rbw lock` is run, or the agent exits, the in-memory User Key
 and organization keys are cleared. Configuration changes take effect after the
 agent is restarted (for example with `rbw stop-agent`).
 
-### Face setup (GNU/Linux)
+### Face enrollment (GNU/Linux)
 
-**Howdy face recognition is the only supported biometric setup backend.**
-Fingerprint setup and automatic edits to sudo/login authentication are not
-provided. Master Password remains the cold-unlock path; face authorization
-only permits operations within an already unlocked session and renews it.
-
-Install the distribution's current Howdy package with the native
-`pam_howdy.so` module, select its IR camera, and enroll a face for your normal
-Linux user. These hardware-specific dependencies and face models are not
-included in the Homebrew package. Follow the
-[Howdy installation guide](https://github.com/boltgolt/howdy#installation);
-camera selection and enrollment are a one-time prerequisite, not something
-rbw can verify without a camera.
-
-After configuring Howdy, run as your normal user:
+Install the fork, then log in normally:
 
 ```sh
-rbw setup --apply
-rbw setup --check
-rbw stop-agent
-rbw unlock
-rbw get <entry>
+brew install ylang-ylang/tap/rbw
+rbw login
 ```
 
-`setup` and `setup --check` are read-only. `--apply` explicitly installs only
-the root-owned, mode-0644 `/etc/pam.d/rbw-device-auth` policy, using the trusted
-native Howdy module. It does not overwrite an administrator's unrelated policy,
-change sudo/login, enroll a face, or elevate the rbw agent. Reapplying the
-same managed policy is safe. Restart the agent to select the new local mode.
+After a successful interactive login, rbw asks once:
 
-A successful preflight means the integration files are configured, **not**
-that a real face was recognized. Check a real match and a non-match on the
-laptop before relying on it. Face failure, cancellation, a missing module,
-or policy removal must reject secret access, never silently enable remote mode
-in a running local agent.
+```text
+Enable face authorization for rbw? [y/N]
+```
 
-Howdy is a convenience gate, not hardware-backed Face ID or a defense against
-root. Its upstream
-[security warning](https://github.com/boltgolt/howdy#a-note-on-security)
-explicitly notes spoofing risks. Keep the normal system password and Master
-Password recovery paths.
+Press Enter to keep ordinary rbw behavior. Opting in deploys the precompiled
+Howdy runtime installed with the package, discovers the IR camera, enrolls your
+face, verifies recognition and desktop notifications, and activates the agent
+mode. No manual Howdy, PAM editing or agent restart commands are required.
+System deployment requests administrator authorization, but never runs apt,
+pip, a compiler, or a network download. Missing precompiled components fail
+explicitly instead of falling back to a build on your laptop.
+
+Enrollment is offered only with interactive input/output; pipelines never prompt.
+Use `rbw setup --apply` to opt in later or repair enrollment. `rbw setup` and
+`rbw setup --check` remain read-only diagnostics. No sudo/login PAM policy is
+changed, and an administrator's foreign rbw policy is never overwritten.
+
+Master Password still unlocks a cold password vault. Face authorization gates
+subsequent secret reads, explicit syncs, device approvals and default-policy SSH
+signatures; it does not supply or derive encryption keys. Each local authorization
+sends a secret-free desktop notification while recognition runs. Face failure,
+cancellation, notification delivery failure or a missing policy rejects access.
+Desktop Do Not Disturb can hide a notification even after the daemon accepts it.
+
+Failed enrollment is not saved as enabled. The bundled Linux x86_64 runtime
+targets Ubuntu 22.04/24.04; unsupported hardware/platforms are reported instead
+of silently enabling a fallback. Actual camera recognition still needs laptop
+verification; synthetic PAM smoke cannot prove face accuracy or spoof resistance.
+
+Howdy is a convenience gate, not hardware-backed Face ID or protection against
+root. Its [security warning](https://github.com/boltgolt/howdy#a-note-on-security)
+notes spoofing risks. Keep your system password and Master Password recovery
+paths. macOS supports requester/remote use, not local Howdy enrollment.
 
 ### No-hardware face smoke
 
@@ -194,6 +200,11 @@ a synthetic `pam_howdy.so` to produce success, rejection, cancellation and
 blocking behavior. It cannot validate camera drivers, face matching, liveness,
 false accepts, or the laptop's camera/model permissions. No simulator or
 authorization bypass is installed by the Homebrew formula.
+The published runtime pinned in `src/bin/rbw/face-runtime.json` is mounted at
+`/input/face-runtime.tar.gz` for offline deployment checks. The smoke also drives
+real login PTYs, verifies default-No and failed-enrollment rollback, deploys the
+actual bundle without a compiler/package resolver, and exercises its native
+notification executable over an isolated user-session D-Bus service.
 
 ### Profiles
 

@@ -1,21 +1,69 @@
-//! Read-only preflight and narrowly scoped installation of rbw's own PAM policy.
+//! Opt-in face onboarding and read-only inspection of rbw's isolated PAM policy.
+
+use std::io::{IsTerminal as _, Write as _};
+
+use anyhow::Context as _;
+
+pub fn run(apply: bool) -> anyhow::Result<()> {
+    if apply {
+        anyhow::ensure!(interactive(), "face setup requires an interactive terminal in your local desktop session");
+        enable(true).context("face activation failed")
+    } else {
+        check()
+    }
+}
+
+pub fn after_login() -> anyhow::Result<()> {
+    let mut config = rbw::config::Config::load()?;
+    if config.face_auth.is_some() || !interactive() {
+        return Ok(());
+    }
+    eprint!("Enable face authorization for rbw? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        enable(false).context("login succeeded, but face activation failed")
+    } else {
+        config.face_auth = Some(false);
+        config.save()?;
+        crate::commands::reload_session_config()?;
+        eprintln!("Face authorization is off. You can enable it later with `rbw setup --apply`.");
+        Ok(())
+    }
+}
+
+fn interactive() -> bool {
+    !rustix::process::geteuid().is_root()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn run(apply: bool) -> anyhow::Result<()> {
-    linux::run(apply)
+fn enable(reconfigure: bool) -> anyhow::Result<()> {
+    linux::enable(reconfigure)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn check() -> anyhow::Result<()> {
+    linux::check()
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn run(_apply: bool) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "face setup requires GNU/Linux and the native Howdy pam_howdy.so module"
-    )
+fn enable(_reconfigure: bool) -> anyhow::Result<()> {
+    check()
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn check() -> anyhow::Result<()> {
+    anyhow::bail!("face setup requires GNU/Linux and native Howdy")
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod linux {
     use std::fs::{self, File, Metadata, OpenOptions};
-    use std::io::{Read as _, Write as _};
+    use std::io::{Read as _, Seek as _, Write as _};
     use std::os::unix::fs::{
         MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     };
@@ -32,6 +80,7 @@ mod linux {
     // Only distro-controlled system locations, never Homebrew, PATH, an
     // environment override, or a user-supplied module name.
     const MODULE_DIRS: &[&str] = &[
+        "/usr/lib/security/rbw-howdy",
         "/usr/lib/security",
         "/usr/lib64/security",
         "/usr/lib/x86_64-linux-gnu/security",
@@ -52,88 +101,711 @@ mod linux {
         "/lib/s390x-linux-gnu/security",
     ];
 
-    pub(super) fn run(apply: bool) -> anyhow::Result<()> {
-        guidance();
-        let howdy = find_module("pam_howdy.so").context(
-            "install native Howdy (pam_howdy.so) using your distro's instructions; \
-             legacy Python PAM shims and fingerprint fallbacks are not supported",
-        )?;
-        let permit = find_module("pam_permit.so")
-            .context("install your distro's system PAM modules package")?;
-        println!("Trusted native Howdy module: {}", howdy.display());
-        let policy = policy_text(&howdy, &permit);
+    pub(super) fn check() -> anyhow::Result<()> {
+        let howdy = find_module("pam_howdy.so")
+            .context("native Howdy is missing; use `rbw setup --apply` to enable face authorization")?;
+        let permit = find_module("pam_permit.so")?;
         trusted_directory(Path::new(PAM_DIR))?;
-        let installed = policy_matches(&policy)?;
-        if !installed && !apply {
-            bail!(
-                "{POLICY} is not installed; after Howdy setup, run `rbw setup --apply` \
-                 to authorize installation of this isolated policy"
-            );
-        }
-        if !installed {
-            install_policy(&policy)?;
-        }
-        println!("Configuration ready: {POLICY} (face only; no password fallback).");
-        println!(
-            "Hardware authentication NOT VERIFIED: camera configuration, runtime \
-             access, Howdy model files and enrollment are not checked by setup."
+        ensure!(
+            policy_matches(&policy_text(&howdy, &permit))?,
+            "{POLICY} is missing; use `rbw setup --apply`"
         );
-        println!(
-            "Verify real face success, rejection and cancellation through a normal \
-             protected rbw command in your local graphical session after a master-password unlock."
-        );
+        println!("Trusted native Howdy module: {}", howdy.display());
+        println!("Dedicated face-only policy: {POLICY}; sudo/login policies are unchanged.");
+        println!("Read-only check: hardware authentication is NOT VERIFIED.");
         Ok(())
     }
 
-    fn guidance() {
-        println!("rbw setup checks configuration only; it never authenticates or accesses the vault.");
-        println!("1. Install native Howdy for your distro: https://github.com/boltgolt/howdy");
-        println!(
-            "   Keep sudo/login PAM stacks unchanged; rbw uses only {POLICY}. \
-             Review any global PAM changes made by the distro's Howdy installer."
+    pub(super) fn enable(reconfigure: bool) -> anyhow::Result<()> {
+        ensure!(
+            !rustix::process::geteuid().is_root(),
+            "run rbw as your ordinary desktop user, never as root"
         );
-        println!(
-            "2. Configure the IR camera/device and required model files using Howdy's \
-             own instructions (`sudo howdy config`); verify camera permissions for \
-             your ordinary, non-root rbw-agent user. Never run rbw-agent as root."
+        let mut config = rbw::config::Config::load()?;
+        let previous = config.face_auth;
+        let user = login_user()?;
+        let environment = rbw::protocol::Environment::new(
+            None,
+            std::env::vars_os()
+                .filter(|(key, _)| {
+                    rbw::protocol::ENVIRONMENT_VARIABLES_OS.contains(key)
+                })
+                .collect(),
         );
-        let user = login_user();
-        println!(
-            "3. Enroll your actual login user: sudo howdy -U {user} add"
-        );
-        println!("   Camera diagnostic only: sudo howdy -U {user} test (not proof of rbw PAM authentication).");
-        println!("4. Run rbw setup --apply, then rbw setup --check (both leave hardware unverified).");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        // Inspect any existing policy BEFORE requesting privilege or changing
+        // dependencies. A foreign policy is never silently migrated.
+        let existing_howdy = optional_module("pam_howdy.so")?;
+        let permit = find_module("pam_permit.so")?;
+        trusted_directory(Path::new(PAM_DIR))?;
+        let installed_policy = if let Some(howdy) = &existing_howdy {
+            policy_matches(&policy_text(howdy, &permit))?
+        } else {
+            ensure!(fs::symlink_metadata(POLICY).is_err(), "{POLICY} exists without a trusted native Howdy module; refusing to change it");
+            false
+        };
+        eprintln!("Face authorization keeps the master password for cold unlock. Howdy is a convenience check, not hardware-backed identity assurance.");
+        eprintln!("rbw will request sudo only to deploy its prebuilt face runtime, configure its isolated policy and enroll your face. It never installs packages, builds code, or changes sudo/login PAM policies.");
+
+        // Existing distro Howdy remains administrator-owned. Reuse a complete
+        // enrollment without rewriting its configuration or models.
+        let configured = if reconfigure
+            && existing_howdy.as_ref().is_some_and(|module| {
+                module.starts_with("/usr/lib/security/rbw-howdy")
+            }) {
+            None
+        } else {
+            existing_howdy
+                .as_deref()
+                .map(|module| configured_camera(module, &user))
+                .transpose()?
+                .flatten()
+        };
+        let bundled_notifications =
+            "/usr/lib/security/rbw-howdy/runtime/bin/notify-send";
+        let notifications = if fs::symlink_metadata(bundled_notifications)
+            .is_err()
+            && configured.is_some()
+            && !existing_howdy
+                .as_ref()
+                .is_some_and(|module| module.starts_with(BUNDLE_ROOT))
+        {
+            "/usr/bin/notify-send"
+        } else {
+            bundled_notifications
+        };
+        let installer = if configured.is_some() {
+            if notifications.starts_with(BUNDLE_ROOT) {
+                installed_bundle(&bundle_manifest()?)?;
+            }
+            trusted_file(Path::new(notifications))
+                .context("the configured face backend has no trusted notification runtime; face authorization remains disabled")?;
+            None
+        } else {
+            ensure!(!installed_policy || existing_howdy.as_ref().is_some_and(|module| module.starts_with("/usr/lib/security/rbw-howdy")),
+                "the existing dedicated policy selects incomplete system Howdy; refusing to migrate or overwrite it");
+            Some(Installer::stage()?)
+        };
+        let mut prepared = false;
+        let mut created_policy = None;
+        let mut temporary_preference = false;
+        let mut preference_written = false;
+        let result = (|| -> anyhow::Result<()> {
+            let camera = if let Some(camera) = configured {
+                camera
+            } else {
+                let installer =
+                    installer.as_ref().context("installer not staged")?;
+                let output = installer.invoke("prepare", &user)?;
+                prepared = true;
+                let device = std::str::from_utf8(&output.stdout)?.trim();
+                ensure!(
+                    device.starts_with("/dev/") && !device.contains('\n'),
+                    "installer returned an invalid camera path"
+                );
+                PathBuf::from(device)
+            };
+            // Enrollment may need root, but the actual PAM camera access must
+            // work for the ordinary desktop user. Never broaden device modes.
+            use std::os::unix::fs::FileTypeExt as _;
+            ensure!(
+                fs::metadata(&camera)?.file_type().is_char_device(),
+                "configured camera is not a character device"
+            );
+            OpenOptions::new().read(true).write(true).open(&camera)
+                .context("your desktop user cannot access the camera; no permission or group changes were made")?;
+            let howdy = find_module("pam_howdy.so")?;
+            let policy = policy_text(&howdy, &permit);
+            if !policy_matches(&policy)? {
+                if previous.is_none() {
+                    // A crash must not leave an unanswered legacy preference
+                    // auto-detecting the policy before verification succeeded.
+                    config.face_auth = Some(false);
+                    config.save()?;
+                    temporary_preference = true;
+                }
+                let mut created = false;
+                let installation = install_policy(&policy, &mut created);
+                if created {
+                    created_policy = Some(policy);
+                }
+                installation?;
+            }
+            runtime.block_on(rbw::pam_gate::notification_preflight(
+                &environment,
+            ))?;
+            eprintln!("Look into the camera now. Verifying real face authentication as your ordinary user...");
+            let gate = rbw::pam_gate::PamGate::new()?.with_context(
+                environment,
+                "rbw face setup",
+                "Verify face authorization before enabling it",
+            )?;
+            runtime.block_on(gate.authorize())
+                .context("real face verification failed or was cancelled; face authorization was not enabled")?;
+
+            // Apply only after setup UI and real PAM have succeeded; the live
+            // agent retains master-password-unlocked keys across this cutover.
+            config.face_auth = Some(true);
+            preference_written = true;
+            config.save()?;
+            crate::commands::reload_session_config()
+                .context("could not activate the new agent mode")?;
+            Ok(())
+        })();
+        let transaction = if prepared {
+            installer
+                .as_ref()
+                .context("missing prepared installer")?
+                .invoke(
+                    if result.is_ok() { "commit" } else { "rollback" },
+                    &user,
+                )
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let policy_rollback = if result.is_err() {
+            created_policy.map_or(Ok(()), |expected| -> anyhow::Result<()> {
+                ensure!(
+                    policy_matches(&expected)?,
+                    "newly installed policy changed; refusing rollback"
+                );
+                privileged("/usr/bin/rm", &["--".as_ref(), POLICY.as_ref()])?;
+                Ok(())
+            })
+        } else {
+            Ok(())
+        };
+        let cleanup = installer.map_or(Ok(()), Installer::cleanup);
+        if let Err(error) = result {
+            if preference_written || temporary_preference {
+                config.face_auth =
+                    if previous.is_none() && policy_rollback.is_err() {
+                        // Never let a failed cleanup activate legacy auto-detection.
+                        Some(false)
+                    } else {
+                        previous
+                    };
+                config.save().context("face activation failed and restoring the previous preference failed")?;
+                if preference_written {
+                    crate::commands::reload_session_config().context(
+                        "failed to restore the previous agent mode",
+                    )?;
+                }
+            }
+            transaction.context(
+                "face activation failed and enrollment rollback failed",
+            )?;
+            policy_rollback.context(
+                "face activation failed and dedicated-policy rollback failed",
+            )?;
+            cleanup?;
+            return Err(error);
+        }
+        if let Err(error) = transaction.and(cleanup) {
+            eprintln!("Face verification and activation succeeded, but installer cleanup failed: {error:#}");
+        }
+        eprintln!("Face authorization enabled: real PAM verification succeeded. Your current login is preserved; cold unlock still requires the master password.");
+        Ok(())
     }
 
-    fn login_user() -> String {
-        // Do not trust USER/LOGNAME/SUDO_USER for enrollment guidance. A root
-        // invocation cannot infer the intended non-root account reliably.
-        if rustix::process::geteuid().is_root() {
-            return "<your-login-user>".to_owned();
+    fn login_user() -> anyhow::Result<String> {
+        trusted_file(Path::new("/usr/bin/id"))?;
+        let output = Command::new("/usr/bin/id")
+            .arg("-un")
+            .env_clear()
+            .env("PATH", SYSTEM_PATH)
+            .output()
+            .context("failed to resolve login user")?;
+        ensure!(output.status.success(), "cannot resolve login user");
+        let name = std::str::from_utf8(&output.stdout)?.trim();
+        ensure!(!name.is_empty() && !name.starts_with('-') && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c)), "unsupported login user name");
+        Ok(name.to_owned())
+    }
+
+    fn configured_camera(
+        module: &Path,
+        user: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let base = if module.starts_with("/usr/lib/security/rbw-howdy") {
+            "/etc/rbw-howdy"
+        } else {
+            "/etc/howdy"
+        };
+        let config = Path::new(base).join("config.ini");
+        let model =
+            Path::new(base).join("models").join(format!("{user}.dat"));
+        if !config.exists() || !model.exists() {
+            return Ok(None);
         }
-        let result = trusted_file(Path::new("/usr/bin/id")).and_then(|_| {
-            Command::new("/usr/bin/id")
-                .arg("-un")
-                .env_clear()
-                .env("PATH", SYSTEM_PATH)
-                .output()
-                .context("failed to resolve login user")
-        });
-        if let Ok(output) = result {
-            if output.status.success() {
-                if let Ok(name) = std::str::from_utf8(&output.stdout) {
-                    let name = name.trim();
-                    if !name.is_empty()
-                        && name.bytes().all(|c| {
-                            c.is_ascii_alphanumeric() || b"_-.".contains(&c)
-                        })
+        trusted_file(&config)?;
+        trusted_file(&model)?;
+        let text = fs::read_to_string(&config)?;
+        let mut video = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                video = line == "[video]";
+            } else if video {
+                if let Some((key, value)) = line.split_once('=') {
+                    if key.trim() == "device_path"
+                        && value.trim().starts_with("/dev/")
                     {
-                        return format!("'{name}'");
+                        return Ok(Some(PathBuf::from(value.trim())));
                     }
                 }
             }
         }
-        "<your-login-user>".to_owned()
+        Ok(None)
+    }
+
+    const BUNDLE_ROOT: &str = "/usr/lib/security/rbw-howdy";
+    const BUNDLE_PLATFORM: &str = "linux-x86_64-ubuntu22.04";
+
+    #[derive(serde::Deserialize)]
+    struct BundleManifest {
+        version: String,
+        platform: String,
+        sha256: String,
+    }
+
+    fn bundle_manifest() -> anyhow::Result<BundleManifest> {
+        let manifest: BundleManifest =
+            serde_json::from_str(include_str!("face-runtime.json"))?;
+        ensure!(
+            manifest.version == env!("CARGO_PKG_VERSION")
+                && manifest.platform == BUNDLE_PLATFORM
+                && manifest.sha256.len() == 64
+                && manifest
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "this rbw release has no matching prebuilt face runtime"
+        );
+        Ok(manifest)
+    }
+
+    fn file_digest(path: &Path) -> anyhow::Result<String> {
+        use sha2::{Digest as _, Sha256};
+        let mut file = open_regular(path)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    fn trusted_bundle_tree(path: &Path) -> anyhow::Result<usize> {
+        let metadata = trusted_metadata(path)?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "face runtime contains a symbolic link"
+        );
+        if metadata.is_dir() {
+            let mut count = 0;
+            for entry in fs::read_dir(path)? {
+                count += trusted_bundle_tree(&entry?.path())?;
+            }
+            Ok(count)
+        } else {
+            ensure!(
+                metadata.is_file() && metadata.nlink() == 1,
+                "face runtime contains a special or hard-linked file"
+            );
+            Ok(1)
+        }
+    }
+
+    fn installed_bundle(manifest: &BundleManifest) -> anyhow::Result<()> {
+        let root = Path::new(BUNDLE_ROOT);
+        trusted_directory(root)?;
+        let installed_files = trusted_bundle_tree(root)?;
+        let identity = root.join(".rbw-bundle-sha256");
+        trusted_file(&identity)?;
+        ensure!(fs::read_to_string(identity)?.trim() == manifest.sha256,
+            "existing face runtime differs from this prebuilt release; refusing to overwrite it");
+        trusted_file(&root.join(".rbw-managed"))?;
+        let inventory_path = root.join("bundle-manifest.json");
+        trusted_file(&inventory_path)?;
+        let inventory: serde_json::Value =
+            serde_json::from_reader(open_regular(&inventory_path)?)?;
+        ensure!(inventory["schema"] == 1
+            && inventory["version"] == manifest.version
+            && inventory["platform"] == manifest.platform,
+            "existing face runtime has no matching bundle manifest; refusing to overwrite it");
+        let files = inventory["files"]
+            .as_object()
+            .context("face runtime manifest has no file inventory")?;
+        ensure!(!files.is_empty(), "face runtime inventory is empty");
+        ensure!(
+            installed_files == files.len() + 2,
+            "face runtime contains files outside its release inventory"
+        );
+        for (name, digest) in files {
+            let relative = Path::new(name);
+            ensure!(
+                !relative.as_os_str().is_empty()
+                    && relative.components().all(|part| matches!(
+                        part,
+                        std::path::Component::Normal(_)
+                    )),
+                "unsafe face runtime inventory path"
+            );
+            let path = root.join(relative);
+            trusted_file(&path)?;
+            ensure!(
+                file_digest(&path)?
+                    == digest
+                        .as_str()
+                        .context("invalid face runtime file hash")?,
+                "installed face runtime file changed: {}",
+                path.display()
+            );
+        }
+        for name in [
+            "pam_howdy.so",
+            "default-config.ini",
+            "runtime/bin/python3",
+            "runtime/bin/notify-send",
+            "runtime/bin/v4l2-ctl",
+        ] {
+            trusted_file(&root.join(name))?;
+        }
+        Ok(())
+    }
+
+    fn deploy_bundle() -> anyhow::Result<()> {
+        let manifest = bundle_manifest()?;
+        if fs::symlink_metadata(BUNDLE_ROOT).is_ok() {
+            return installed_bundle(&manifest);
+        }
+        ensure!(cfg!(target_arch = "x86_64"), "prebuilt face runtime is unavailable on this architecture; no source-build fallback is provided");
+        trusted_file(Path::new("/etc/os-release"))?;
+        let release = fs::read_to_string("/etc/os-release")?;
+        let value = |key: &str| {
+            release.lines().find_map(|line| {
+                line.strip_prefix(key).map(|value| value.trim_matches('"'))
+            })
+        };
+        ensure!(value("ID=") == Some("ubuntu")
+            && matches!(value("VERSION_ID="), Some("22.04" | "24.04")),
+            "prebuilt face runtime is available only for Ubuntu 22.04/24.04 x86_64; no package installation or source-build fallback is provided");
+        let executable = fs::canonicalize(std::env::current_exe()?)?;
+        let keg = executable
+            .parent()
+            .and_then(Path::parent)
+            .context("cannot locate the installed rbw keg")?;
+        let archive = keg.join("libexec/face-runtime.tar.gz");
+        ensure!(fs::symlink_metadata(&archive).is_ok(),
+            "the installed rbw package is missing its matching prebuilt face runtime ({}); face authorization remains disabled; no download or source-build fallback is provided",
+            archive.display());
+        let archive_file = open_regular(&archive)?;
+        // Only data crosses from the user-writable keg. Root never executes a
+        // helper, interpreter, or library until the root-owned copy is checked.
+        trusted_directory(Path::new("/usr/lib"))?;
+        let output = privileged(
+            "/usr/bin/mktemp",
+            &[
+                "-d".as_ref(),
+                "--".as_ref(),
+                "/usr/lib/.rbw-face-deploy.XXXXXXXXXXXX".as_ref(),
+            ],
+        )?;
+        let stage = std::str::from_utf8(&output.stdout)?.trim();
+        let suffix = stage
+            .strip_prefix("/usr/lib/.rbw-face-deploy.")
+            .context("unexpected face deployment staging path")?;
+        ensure!(
+            suffix.len() == 12
+                && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "unsafe face deployment staging path"
+        );
+        let stage = Path::new(stage);
+        let result = (|| -> anyhow::Result<()> {
+            privileged(
+                "/usr/bin/install",
+                &[
+                    "-d".as_ref(),
+                    "-o".as_ref(),
+                    "0".as_ref(),
+                    "-g".as_ref(),
+                    "0".as_ref(),
+                    "-m".as_ref(),
+                    "0755".as_ref(),
+                    "--".as_ref(),
+                    stage.as_os_str(),
+                ],
+            )?;
+            trusted_directory(stage)?;
+            let snapshot = stage.join("face-runtime.tar.gz");
+            privileged_input(
+                "/usr/bin/install",
+                &[
+                    "-o".as_ref(),
+                    "0".as_ref(),
+                    "-g".as_ref(),
+                    "0".as_ref(),
+                    "-m".as_ref(),
+                    "0644".as_ref(),
+                    "--".as_ref(),
+                    "/proc/self/fd/0".as_ref(),
+                    snapshot.as_os_str(),
+                ],
+                Some(&archive_file),
+            )?;
+            trusted_file(&snapshot)?;
+            ensure!(fs::symlink_metadata(&snapshot)?.nlink() == 1
+                && file_digest(&snapshot)? == manifest.sha256,
+                "prebuilt face runtime SHA-256 mismatch; refusing privileged extraction");
+            // The checked archive is a release artifact, not arbitrary input.
+            // Still reject any member outside the single permitted subtree.
+            let listing = privileged(
+                "/usr/bin/tar",
+                &[
+                    "--list".as_ref(),
+                    "--gzip".as_ref(),
+                    "--file".as_ref(),
+                    snapshot.as_os_str(),
+                    "--quoting-style=escape".as_ref(),
+                ],
+            )?;
+            let listing = std::str::from_utf8(&listing.stdout)?;
+            ensure!(
+                !listing.is_empty()
+                    && listing.lines().all(|name| {
+                        !name.contains('\\')
+                            && name.starts_with("rbw-howdy/")
+                            && Path::new(name).components().all(|part| {
+                                matches!(
+                                    part,
+                                    std::path::Component::Normal(_)
+                                )
+                            })
+                    }),
+                "prebuilt archive contains paths outside rbw-howdy"
+            );
+            privileged(
+                "/usr/bin/tar",
+                &[
+                    "--extract".as_ref(),
+                    "--gzip".as_ref(),
+                    "--no-same-owner".as_ref(),
+                    "--no-same-permissions".as_ref(),
+                    "--file".as_ref(),
+                    snapshot.as_os_str(),
+                    "--directory".as_ref(),
+                    stage.as_os_str(),
+                ],
+            )?;
+            let unpacked = stage.join("rbw-howdy");
+            trusted_directory(&unpacked)?;
+            trusted_bundle_tree(&unpacked)?;
+            // Record the authenticated archive identity as root-owned data.
+            let source_dir = tempfile::Builder::new()
+                .prefix("rbw-bundle-id-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")?;
+            let mut identity =
+                tempfile::NamedTempFile::new_in(source_dir.path())?;
+            identity.write_all(manifest.sha256.as_bytes())?;
+            identity.flush()?;
+            let target = unpacked.join(".rbw-bundle-sha256");
+            ensure!(
+                fs::symlink_metadata(&target).is_err(),
+                "archive contains reserved deployment identity"
+            );
+            privileged_input(
+                "/usr/bin/install",
+                &[
+                    "-o".as_ref(),
+                    "0".as_ref(),
+                    "-g".as_ref(),
+                    "0".as_ref(),
+                    "-m".as_ref(),
+                    "0644".as_ref(),
+                    "--".as_ref(),
+                    "/proc/self/fd/0".as_ref(),
+                    target.as_os_str(),
+                ],
+                Some(identity.as_file()),
+            )?;
+            trusted_file(&target)?;
+            ensure!(
+                fs::read_to_string(&target)? == manifest.sha256,
+                "face runtime identity changed during staging"
+            );
+            if fs::symlink_metadata("/usr/lib/security").is_err() {
+                privileged(
+                    "/usr/bin/install",
+                    &[
+                        "-d".as_ref(),
+                        "-o".as_ref(),
+                        "0".as_ref(),
+                        "-g".as_ref(),
+                        "0".as_ref(),
+                        "-m".as_ref(),
+                        "0755".as_ref(),
+                        "--".as_ref(),
+                        "/usr/lib/security".as_ref(),
+                    ],
+                )?;
+            }
+            trusted_directory(Path::new("/usr/lib/security"))?;
+            ensure!(fs::symlink_metadata(BUNDLE_ROOT).is_err(),
+                "face runtime destination appeared during deployment; refusing to overwrite it");
+            privileged(
+                "/usr/bin/mv",
+                &[
+                    "--no-clobber".as_ref(),
+                    "-T".as_ref(),
+                    "--".as_ref(),
+                    unpacked.as_os_str(),
+                    BUNDLE_ROOT.as_ref(),
+                ],
+            )?;
+            ensure!(
+                !unpacked.exists(),
+                "face runtime destination changed during deployment"
+            );
+            installed_bundle(&manifest)
+        })();
+        let cleanup = privileged(
+            "/usr/bin/rm",
+            &["-r".as_ref(), "--".as_ref(), stage.as_os_str()],
+        );
+        result?;
+        cleanup.context(
+            "face runtime deployed, but root staging cleanup failed",
+        )?;
+        Ok(())
+    }
+
+    struct Installer {
+        snapshot: PathBuf,
+    }
+
+    impl Installer {
+        fn stage() -> anyhow::Result<Self> {
+            use sha2::{Digest as _, Sha256};
+            const SCRIPT: &str = include_str!("face_installer.py");
+            deploy_bundle()?;
+            // Root executes only an independently checked root-owned snapshot,
+            // never the caller's temporary source or a downloaded shell script.
+            trusted_directory(Path::new("/usr/lib"))?;
+            let source_dir = tempfile::Builder::new()
+                .prefix("rbw-face-source-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")?;
+            let mut source =
+                tempfile::NamedTempFile::new_in(source_dir.path())?;
+            source.write_all(SCRIPT.as_bytes())?;
+            source.flush()?;
+            let output = privileged(
+                "/usr/bin/mktemp",
+                &[
+                    "--".as_ref(),
+                    "/usr/lib/.rbw-face-installer.XXXXXXXXXXXX".as_ref(),
+                ],
+            )?;
+            let snapshot = std::str::from_utf8(&output.stdout)?.trim();
+            let suffix = snapshot
+                .strip_prefix("/usr/lib/.rbw-face-installer.")
+                .context("unexpected installer staging path")?;
+            ensure!(
+                suffix.len() == 12
+                    && suffix.bytes().all(|c| c.is_ascii_alphanumeric()),
+                "unsafe installer staging path"
+            );
+            let installer = Self {
+                snapshot: PathBuf::from(snapshot),
+            };
+            let result = (|| -> anyhow::Result<()> {
+                privileged_input(
+                    "/usr/bin/install",
+                    &[
+                        "-o".as_ref(),
+                        "0".as_ref(),
+                        "-g".as_ref(),
+                        "0".as_ref(),
+                        "-m".as_ref(),
+                        "0644".as_ref(),
+                        "--".as_ref(),
+                        "/proc/self/fd/0".as_ref(),
+                        installer.snapshot.as_os_str(),
+                    ],
+                    Some(source.as_file()),
+                )?;
+                trusted_file(&installer.snapshot)?;
+                let file = open_regular(&installer.snapshot)?;
+                let metadata = file.metadata()?;
+                ensure!(
+                    metadata.uid() == 0
+                        && metadata.mode() & 0o7777 == 0o644
+                        && metadata.nlink() == 1,
+                    "unsafe root-owned installer snapshot"
+                );
+                let mut bytes = Vec::new();
+                file.take(u64::try_from(SCRIPT.len())? + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(Sha256::digest(&bytes) == Sha256::digest(SCRIPT.as_bytes()), "installer snapshot changed; refusing privileged execution");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                installer.cleanup()?;
+                return Err(error);
+            }
+            Ok(installer)
+        }
+
+        fn invoke(
+            &self,
+            action: &str,
+            user: &str,
+        ) -> anyhow::Result<std::process::Output> {
+            let uid = rustix::process::geteuid().as_raw().to_string();
+            let pid = std::process::id().to_string();
+            privileged(
+                "/usr/lib/security/rbw-howdy/runtime/bin/python3",
+                &[
+                    "-I".as_ref(),
+                    "-B".as_ref(),
+                    self.snapshot.as_os_str(),
+                    action.as_ref(),
+                    user.as_ref(),
+                    uid.as_ref(),
+                    pid.as_ref(),
+                ],
+            )
+        }
+
+        fn cleanup(self) -> anyhow::Result<()> {
+            privileged(
+                "/usr/bin/rm",
+                &["--".as_ref(), self.snapshot.as_os_str()],
+            )?;
+            Ok(())
+        }
+    }
+
+    fn optional_module(name: &str) -> anyhow::Result<Option<PathBuf>> {
+        for directory in MODULE_DIRS {
+            match fs::symlink_metadata(Path::new(directory).join(name)) {
+                Ok(_) => return find_module(name).map(Some),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .context("cannot inspect native PAM module")
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn policy_text(howdy: &Path, permit: &Path) -> String {
@@ -284,6 +956,17 @@ mod linux {
         tool: &str,
         args: &[&std::ffi::OsStr],
     ) -> anyhow::Result<std::process::Output> {
+        privileged_input(tool, args, None)
+    }
+
+    fn privileged_input(
+        tool: &str,
+        args: &[&std::ffi::OsStr],
+        input: Option<&File>,
+    ) -> anyhow::Result<std::process::Output> {
+        for directory in SYSTEM_PATH.split(':') {
+            trusted_directory(Path::new(directory))?;
+        }
         trusted_file(Path::new(tool))?;
         let mut command = if rustix::process::geteuid().is_root() {
             Command::new(tool)
@@ -293,11 +976,21 @@ mod linux {
             command.arg("--").arg(tool);
             command
         };
+        // Use an already-open unprivileged descriptor. A source pathname could
+        // otherwise be swapped for a root-only file before sudo opens it.
+        let stdin = match input {
+            Some(file) => {
+                let mut input = file.try_clone()?;
+                input.rewind()?;
+                Stdio::from(input)
+            }
+            None => Stdio::inherit(),
+        };
         let output = command
             .args(args)
             .env_clear()
             .env("PATH", SYSTEM_PATH)
-            .stdin(Stdio::inherit())
+            .stdin(stdin)
             .stderr(Stdio::inherit())
             .output()
             .with_context(|| {
@@ -307,7 +1000,10 @@ mod linux {
         Ok(output)
     }
 
-    fn install_policy(expected: &str) -> anyhow::Result<()> {
+    fn install_policy(
+        expected: &str,
+        created: &mut bool,
+    ) -> anyhow::Result<()> {
         // The source lives in a private directory in the fixed system /tmp,
         // never TMPDIR. Even if the invoking user changes it concurrently, only
         // an independently verified root-owned snapshot is ever published.
@@ -364,7 +1060,7 @@ mod linux {
                     && metadata.nlink() == 1,
                 "unsafe root-owned staging file"
             );
-            privileged(
+            privileged_input(
                 "/usr/bin/install",
                 &[
                     "-o".as_ref(),
@@ -374,9 +1070,10 @@ mod linux {
                     "-m".as_ref(),
                     "0644".as_ref(),
                     "--".as_ref(),
-                    source.path().as_os_str(),
+                    "/proc/self/fd/0".as_ref(),
                     stage.as_os_str(),
                 ],
+                Some(source.as_file()),
             )?;
             trusted_file(stage)?;
             let file = open_regular(stage)?;
@@ -406,6 +1103,7 @@ mod linux {
                     POLICY.as_ref(),
                 ],
             )?;
+            *created = true;
             Ok(())
         })();
         // Never recursively delete a path and never act on unvalidated output.

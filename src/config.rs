@@ -16,6 +16,9 @@ pub struct Config {
     pub lock_timeout: u64,
     #[serde(default = "default_l1_timeout")]
     pub l1_timeout: u64,
+    /// None preserves an existing installation until interactive onboarding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_auth: Option<bool>,
     #[serde(default = "default_sync_interval")]
     pub sync_interval: u64,
     #[serde(default = "default_pinentry")]
@@ -41,6 +44,7 @@ impl Default for Config {
             notifications_url: None,
             lock_timeout: default_lock_timeout(),
             l1_timeout: default_l1_timeout(),
+            face_auth: None,
             sync_interval: default_sync_interval(),
             pinentry: default_pinentry(),
             unlock_helper: None,

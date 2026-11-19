@@ -24,11 +24,12 @@ struct FindArgs {
 #[command(version, about = "Unofficial Bitwarden CLI")]
 enum Opt {
     #[command(
-        about = "Check or install the isolated Linux Howdy face-authentication policy",
-        long_about = "Check Linux Howdy face-authentication prerequisites without \
-            authenticating or changing files. Use --apply to explicitly install \
-            only /etc/pam.d/rbw-device-auth; sudo/login policies are never changed. \
-            Camera access and face enrollment require separate Howdy setup."
+        about = "Check or configure face authorization for rbw",
+        long_about = "Check rbw's isolated Linux face-authentication policy without \
+            changing files. Use --apply to enable or repair face authorization: \
+            provision native Howdy and desktop notifications, configure an IR camera, \
+            enroll your face and verify real authentication. May request sudo; \
+            sudo/login PAM policies are never changed. Run as your normal desktop user."
     )]
     Setup {
         #[arg(
@@ -39,7 +40,7 @@ enum Opt {
         check: bool,
         #[arg(
             long,
-            help = "Explicitly install the isolated root-owned PAM policy; may request sudo"
+            help = "Enable or repair face authorization interactively; may request sudo"
         )]
         apply: bool,
     },
@@ -381,6 +382,9 @@ impl Config {
 }
 
 fn main() {
+    if rbw::pam_gate::helper_requested() {
+        std::process::exit(if rbw::pam_gate::run_helper() { 0 } else { 1 });
+    }
     let opt = Opt::parse();
 
     env_logger::Builder::from_env(

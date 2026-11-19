@@ -24,16 +24,8 @@ async fn tokio_main(
     }
 
     let config = rbw::config::Config::load()?;
-    let configured_l1_timeout =
-        std::time::Duration::from_secs(config.l1_timeout);
-    // The local/remote shape is fixed for this agent process. A local agent
-    // must fail closed if its policy later becomes unavailable; it must not
-    // silently turn into a remote-mode bypass until the next restart.
-    let pam_gate_required = rbw::pam_gate::PamGate::detect().is_some();
-    let l1_timeout = crate::state::State::effective_l1_timeout(
-        configured_l1_timeout,
-        pam_gate_required,
-    );
+    // Apply enrollment changes without exporting or discarding an unlocked key.
+    let session = crate::state::SessionSettings::from_config(&config);
     let sync_timeout_duration =
         std::time::Duration::from_secs(config.sync_interval);
     let (timeout, timer_r) = crate::timeout::Timeout::new();
@@ -48,9 +40,10 @@ async fn tokio_main(
             org_keys: None,
             clear_generation: tokio::sync::watch::channel(0).0,
             timeout,
-            l1_timeout,
+            l1_timeout: session.timeout,
             last_bio_success: None,
-            pam_gate_required,
+            pam_gate_required: session.pam_gate_required,
+            ordinary_session: session.ordinary_session,
             sync_timeout,
             sync_timeout_duration,
             notifications_handler,

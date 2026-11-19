@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.17.0] - 2026-11-19
+
+### Added
+
+* Interactive `rbw login` offers one-time face enrollment, defaulting to No.
+  Opting in prepares the isolated Howdy installation, camera and model, verifies
+  recognition and desktop notifications, and activates the agent automatically.
+* Linux face components are delivered as a precompiled, dependency-complete
+  runtime with Python, dlib, OpenCV, models and native libraries. Enrollment
+  deploys that installed payload offline; it never installs packages or builds
+  dependencies on the user's machine.
+* Every local PAM authorization delivers a secret-free desktop notification
+  concurrently with recognition; notification delivery failure denies access.
+
+### Changed
+
+* Declining face enrollment uses ordinary request-renewed `lock_timeout` sessions.
+  Explicitly enabled face authorization never downgrades to remote mode when its
+  policy is missing, including after agent restarts.
+* Local-mode SSH signing with the default policy now requires a fresh face
+  authorization rather than treating an unlocked session as sufficient.
+
 ## [1.16.0] - 2026-11-19
 
 ## Added
