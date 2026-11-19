@@ -27,7 +27,6 @@ ENV = {"PATH": str(RUNTIME / "bin") + ":/usr/sbin:/usr/bin:/sbin:/bin",
 # Executed only by the authenticated private interpreter, never from a user file.
 # Tap Howdy's existing recorder; do not open another camera or alter its frames.
 ENROLLMENT_PREVIEW = r"""
-import base64
 import json
 import os
 import runpy
@@ -57,16 +56,16 @@ def check_cancelled():
 original_read_frame = VideoCapture.read_frame
 
 
-def preview_read_frame(self):
+def preview_read_frame(self, frame_number=None):
     check_cancelled()
     result = original_read_frame(self)
     check_cancelled()
-    frame_number = getattr(self, "_rbw_preview_frame_number", 0) + 1
+    if frame_number is None:
+        frame_number = getattr(self, "_rbw_preview_frame_number", 0) + 1
     self._rbw_preview_frame_number = frame_number
     now = time.monotonic()
-    if now - getattr(self, "_rbw_preview_last_frame", float("-inf")) < 0.1:
-        return result
-    # Rotation modes 1/2 depend on every read, including unpreviewed frames.
+    preview_due = now - getattr(self, "_rbw_preview_last_frame", float("-inf")) >= 0.1
+    # Use the same one-based frame number as Howdy, including rotation modes 1/2.
     frame = rotate_frame(result[0], self.config.getint("video", "rotate", fallback=0),
                          frame_number)
     grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -76,37 +75,58 @@ def preview_read_frame(self):
                              [0], None, [8], [0, 256])
     darkness = float(histogram[0, 0] / histogram.sum() * 100)
     threshold = self.config.getfloat("video", "dark_threshold", fallback=60.0)
+    self._rbw_enrollment_darkness = darkness
+    if not preview_due:
+        return result
 
-    # Display the source IR image, not the contrast-enhanced recognition input.
-    height, width = frame.shape[:2]
-    scale = min(1.0, 640 / width, 480 / height)
-    if scale < 1:
-        frame = cv2.resize(frame, (max(1, int(width * scale)),
-                                   max(1, int(height * scale))),
-                           interpolation=cv2.INTER_AREA)
-    while True:
-        success, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if not success:
-            raise RuntimeError("cannot encode face enrollment preview")
-        if jpeg.size <= 200 * 1024:
-            break
-        height, width = frame.shape[:2]
-        if height == width == 1:
-            raise RuntimeError("face enrollment preview exceeds size limit")
-        frame = cv2.resize(frame, (max(1, width // 2), max(1, height // 2)),
-                           interpolation=cv2.INTER_AREA)
+    # Pulsed IR can alternate lit/black at 15 fps. A 10 Hz telemetry cap can
+    # repeatedly select black frames; leave the next lit frame eligible instead.
+    # Still publish sustained blackouts once a second rather than freeze.
+    if darkness == 100.0 and now - getattr(self, "_rbw_preview_last_frame", float("-inf")) < 1.0:
+        return result
+
     message = "RBWBIO_PREVIEW " + json.dumps(
-        {"jpeg": base64.b64encode(jpeg).decode("ascii"),
-         "darkness": darkness, "threshold": threshold},
+        {"darkness": darkness, "threshold": threshold},
         separators=(",", ":"), allow_nan=False)
-    if len(message) + 1 > 512 * 1024:
-        raise RuntimeError("face enrollment preview exceeds protocol limit")
+    if len(message.encode("utf-8")) + 1 > 4096:
+        raise RuntimeError("face enrollment telemetry exceeds protocol limit")
     print(message, file=protocol, flush=True)
     self._rbw_preview_last_frame = time.monotonic()
     return result
 
 
-VideoCapture.read_frame = preview_read_frame
+def enrollment_read_frame(self):
+    # Howdy add's 60-frame limit must count usable frames, not IR-off pulses.
+    # Keep its detector, single-face check, encoder and model format unchanged.
+    if not hasattr(self, "_rbw_enrollment_deadline"):
+        self._rbw_enrollment_deadline = time.monotonic() + 30.0
+        self._rbw_enrollment_frames = 0
+        self._rbw_enrollment_black = 0
+        self._rbw_enrollment_dark = 0
+    number = self._rbw_enrollment_frames + 1
+    while time.monotonic() < self._rbw_enrollment_deadline:
+        result = preview_read_frame(self, number)
+        if time.monotonic() >= self._rbw_enrollment_deadline:
+            break
+        darkness = self._rbw_enrollment_darkness
+        if darkness == 100.0:
+            self._rbw_enrollment_black += 1
+        elif darkness > self.config.getfloat("video", "dark_threshold", fallback=60.0):
+            self._rbw_enrollment_dark += 1
+        else:
+            self._rbw_enrollment_frames += 1
+            return result
+    check_cancelled()
+    if self._rbw_enrollment_frames:
+        reason = "not enough usable frames"
+    elif self._rbw_enrollment_dark:
+        reason = "all illuminated frames were too dark"
+    else:
+        reason = "camera yielded only black frames"
+    raise RuntimeError("face enrollment timed out after 30 seconds: " + reason)
+
+
+VideoCapture.read_frame = enrollment_read_frame
 sys.argv = [HOWDY + "/cli.py"] + sys.argv[1:]
 check_cancelled()
 runpy.run_path(HOWDY + "/cli.py", run_name="__main__")
@@ -158,7 +178,7 @@ def run(*args, timeout=1200, capture=False, cwd=None, preview=False):
                 except subprocess.TimeoutExpired:
                     pass
             if status:
-                raise subprocess.CalledProcessError(status, args)
+                raise RuntimeError("face enrollment failed (exit status: " + str(status) + ")")
         except BaseException:
             try:
                 os.killpg(child.pid, signal.SIGTERM)
@@ -333,8 +353,14 @@ def prepare(user, owner_pid):
         try:
             trusted(BASE / "howdy")
             trusted(BASE / "howdy" / "cli.py")
-            run(str(RUNTIME / "bin/python3"), "-B", "-s", "-E", "-c", ENROLLMENT_PREVIEW,
-                "-U", user, "-y", "add", "rbw face", timeout=90, preview=True)
+            deadline = time.monotonic() + 90
+            for sample in range(5):
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "face enrollment timed out")
+                print("Recording face sample " + str(sample + 1) + "/5. Keep looking at the camera.",
+                      file=sys.stderr, flush=True)
+                run(str(RUNTIME / "bin/python3"), "-B", "-s", "-E", "-c", ENROLLMENT_PREVIEW,
+                    "-U", user, "-y", "add", "rbw face", timeout=remaining, preview=True)
         finally:
             os.umask(old_umask)
         trusted(model)

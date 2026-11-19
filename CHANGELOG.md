@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.17.4] - 2026-11-19
+
+### Changed
+
+* Show browser-local RGB video for positioning during enrollment and verification,
+  with IR remaining the sole recognition input. Wait for actual RGB playback
+  before enrollment, and stop capture on cancellation, camera loss or page exit.
+  Browser camera permission is required; no color frames are uploaded.
+
+### Fixed
+
+* Avoid phase-locking IR brightness telemetry to black pulses, while continuing
+  to report sustained blackouts. Recognition thresholds are unchanged.
+* Count only usable frames toward Howdy's enrollment budget, with a separate
+  30-second deadline per sample. Record five samples using Howdy's existing
+  encoder and model format, under a 90-second overall enrollment deadline.
+  Cancellation or partial failure restores the prior configuration and model.
+* Keep enrollment subprocess failures concise instead of echoing the embedded
+  Python program in the command-error message.
+
 ## [1.17.3] - 2026-11-19
 
 ### Fixed

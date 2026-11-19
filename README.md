@@ -179,22 +179,24 @@ Enable face authorization for rbw? [y/N]
 ```
 
 Press Enter to keep ordinary rbw behavior. Opting in deploys the precompiled
-Howdy runtime installed with the package, discovers the IR camera, enrolls your
-face, verifies recognition and desktop notifications, and activates the agent
-mode. No manual Howdy, PAM editing or agent restart commands are required.
+Howdy runtime installed with the package, discovers the IR camera, records five
+face samples, verifies recognition and desktop notifications, and activates the
+agent mode. No manual Howdy, PAM editing or agent restart commands are required.
 System deployment requests administrator authorization, but never runs apt,
 pip, a compiler, or a network download. Missing precompiled components fail
 explicitly instead of falling back to a build on your laptop.
 
-During desktop enrollment, the default browser opens a local live IR preview
-with the darkness percentage and rejection threshold. It displays the same
-frames used for enrollment, not a second camera stream. Use Cancel to abort;
-frames are kept only in memory, never saved or sent to an external service.
-Closing the enrollment process stops the local preview. A terminal without a
-desktop display reports that a preview is unavailable.
-The page remains open for the separate real face-verification step. During
-verification it replaces the recording image with an instruction to look into
-the camera; it does not present the old recording frame as a live feed.
+During desktop enrollment, the default browser opens a local RGB video preview
+for positioning. Allow camera access when the browser asks; IR enrollment starts
+only after the color preview is playing. The browser requests up to 30 fps,
+subject to the webcam's capabilities. RGB video stays inside the browser and is
+never recorded or uploaded. The separate IR camera remains the only input for
+enrollment and authentication; the page labels its darkness readings explicitly.
+The RGB preview stays live during real PAM verification, rather than displaying
+flashing IR frames or a stale recording image. Cancel, closing the page, or a
+running preview camera failure stops RGB capture and cancels the IR transaction.
+Camera-permission or missing-RGB-camera errors are reported explicitly. A terminal
+without a desktop display reports that a preview is unavailable.
 Activation succeeds only after PAM accepts the face. A verification timeout or
 failure is shown explicitly, and the final text remains after the preview ends.
 

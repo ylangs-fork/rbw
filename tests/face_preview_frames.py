@@ -1,13 +1,15 @@
 #!/usr/bin/python3
 """Exercise the embedded enrollment adapter without root, hardware, or model data."""
 import ast
-import base64
 import configparser
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
+import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -91,22 +93,22 @@ class AdapterHarness:
         messages = []
         for line in self.output.getvalue().splitlines():
             assert line.startswith("RBWBIO_PREVIEW "), line
-            assert len(line) + 1 <= 512 * 1024
+            assert len(line.encode("utf-8")) + 1 <= 4096
             messages.append(json.loads(line.removeprefix("RBWBIO_PREVIEW ")))
+            assert set(messages[-1]) == {"darkness", "threshold"}
         return messages
 
-    def run(self, body):
+    def run(self, body, *, enrollment=False):
         def rotate(frame, mode, number):
             self.rotations.append((mode, number))
             return rotated(frame, mode, number)
 
         def run_path(path, run_name):
-            assert path == HOWDY + "/cli.py"
-            assert run_name == "__main__"
-            assert sys.argv == [HOWDY + "/cli.py", "-U", "example", "-y", "add", "rbw face"]
-            assert sys.path == ["/trusted/private-stdlib", HOWDY]
             print("Howdy console output")
-            body(self.capture_type(self.config))
+            capture = self.capture_type(self.config)
+            if not enrollment:
+                capture.read_frame = types.MethodType(namespace["preview_read_frame"], capture)
+            body(capture)
 
         recorders = types.ModuleType("recorders")
         recorders.__path__ = []
@@ -118,6 +120,7 @@ class AdapterHarness:
             "runpy": types.SimpleNamespace(run_path=run_path),
             "time": types.SimpleNamespace(monotonic=lambda: self.clock),
         }
+        namespace = {"__name__": "__main__"}
         try:
             with mock.patch.dict(sys.modules, modules), \
                     mock.patch.object(sys, "stdin", self.stdin), \
@@ -125,7 +128,7 @@ class AdapterHarness:
                     mock.patch.object(sys, "stderr", self.errors), \
                     mock.patch.object(sys, "argv", ["-c", "-U", "example", "-y", "add", "rbw face"]), \
                     mock.patch.object(sys, "path", ["/trusted/private-stdlib", HOWDY]):
-                exec(compile(ADAPTER, "<enrollment-preview-test>", "exec"), {"__name__": "__main__"})
+                exec(compile(ADAPTER, "<enrollment-preview-test>", "exec"), namespace)
         finally:
             self.cancel()
             self.stdin.close()
@@ -153,11 +156,6 @@ class PreviewFramesTest(unittest.TestCase):
         self.assertIsInstance(message["threshold"], float)
         self.assertEqual(message["darkness"], expected_darkness(source))
         self.assertEqual(message["threshold"], 57.5)
-        jpeg = base64.b64decode(message["jpeg"], validate=True)
-        self.assertLessEqual(len(jpeg), 200 * 1024)
-        preview = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-        self.assertEqual(preview.shape, source.shape)
-        self.assertLess(np.abs(preview.astype(float) - source).mean(), 2)
         self.assertIn("Howdy console output", harness.errors.getvalue())
         self.assertNotIn("Howdy console output", harness.output.getvalue())
 
@@ -189,43 +187,46 @@ class PreviewFramesTest(unittest.TestCase):
                     self.assertIs(capture.read_frame(), result)
 
                 harness.run(enroll)
-                self.assertEqual(harness.rotations, [(mode, 1), (mode, 3)])
+                self.assertEqual(harness.rotations, [(mode, 1), (mode, 2), (mode, 3)])
                 messages = harness.messages()
                 self.assertEqual(len(messages), 2)
                 for number, message in zip((1, 3), messages):
                     expected = rotated(source, mode, number)
                     self.assertEqual(message["darkness"], expected_darkness(expected))
-                    preview = cv2.imdecode(np.frombuffer(base64.b64decode(message["jpeg"]),
-                                                        dtype=np.uint8), cv2.IMREAD_COLOR)
-                    self.assertEqual(preview.shape, expected.shape)
-                    self.assertLess(np.abs(preview.astype(float) - expected).mean(), 2)
                 np.testing.assert_array_equal(source[:32, :48], 180)
                 np.testing.assert_array_equal(source[32:], 0)
 
-    def test_preview_dimensions_and_oversized_jpeg_are_bounded(self):
-        frame = np.random.default_rng(1).integers(0, 256, (800, 1200, 3), dtype=np.uint8)
-        original = frame.copy()
-        harness = AdapterHarness([(frame, frame[:, :, 0])])
-        encode = cv2.imencode
-        sizes = []
+    def test_pulsed_ir_does_not_lock_preview_to_black_phase(self):
+        black = np.zeros((64, 96, 3), dtype=np.uint8)
+        lit = np.full_like(black, 180)
+        results = [(frame, frame[:, :, 0]) for frame in (black, lit) * 30]
+        harness = AdapterHarness(results)
 
-        def oversized_once(extension, image, options):
-            sizes.append(image.shape[:2])
-            if len(sizes) == 1:
-                return True, np.zeros(200 * 1024 + 1, dtype=np.uint8)
-            return encode(extension, image, options)
+        def enroll(capture):
+            for number, result in enumerate(results):
+                harness.clock = number / 15
+                self.assertIs(capture.read_frame(), result)
 
-        with mock.patch.object(cv2, "imencode", side_effect=oversized_once):
-            harness.run(lambda capture: capture.read_frame())
-        self.assertEqual(sizes, [(426, 640), (213, 320)])
-        message, = harness.messages()
-        jpeg = base64.b64decode(message["jpeg"], validate=True)
-        self.assertLessEqual(len(jpeg), 200 * 1024)
-        preview = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-        self.assertLessEqual(preview.shape[0], 480)
-        self.assertLessEqual(preview.shape[1], 640)
-        self.assertEqual(message["darkness"], expected_darkness(frame))
-        np.testing.assert_array_equal(frame, original)
+        harness.run(enroll)
+        messages = harness.messages()
+        self.assertTrue(any(message["darkness"] == 0.0 for message in messages))
+        self.assertEqual(sum(message["darkness"] == 100.0 for message in messages), 1)
+
+    def test_sustained_blackout_replaces_last_lit_preview(self):
+        lit = np.full((64, 96, 3), 180, dtype=np.uint8)
+        black = np.zeros_like(lit)
+        results = [(lit, lit[:, :, 0])] + [(black, black[:, :, 0])] * 30
+        harness = AdapterHarness(results)
+
+        def enroll(capture):
+            for number, result in enumerate(results):
+                harness.clock = number / 15
+                self.assertIs(capture.read_frame(), result)
+
+        harness.run(enroll)
+        messages = harness.messages()
+        self.assertEqual(messages[0]["darkness"], 0.0)
+        self.assertEqual(messages[-1]["darkness"], 100.0)
 
     def test_eof_before_start_opens_no_recorder(self):
         harness = AdapterHarness([])
@@ -265,13 +266,131 @@ class PreviewFramesTest(unittest.TestCase):
             harness.run(lambda capture: harness.cancel())
         self.assertEqual(harness.messages(), [])
 
-    def test_unencodable_preview_fails_instead_of_silently_succeeding(self):
-        frame = np.full((64, 96, 3), 180, dtype=np.uint8)
-        harness = AdapterHarness([(frame, frame[:, :, 0])])
-        with mock.patch.object(cv2, "imencode", return_value=(False, None)):
-            with self.assertRaisesRegex(RuntimeError, "cannot encode"):
-                harness.run(lambda capture: capture.read_frame())
-        self.assertEqual(harness.messages(), [])
+
+
+class EnrollmentBudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.black = np.zeros((64, 96, 3), dtype=np.uint8)
+        self.lit = np.full_like(self.black, 180)
+        self.dark = self.black.copy()
+        self.dark[:, -24:] = 180
+
+    def harness(self, frames, step=1 / 15):
+        harness = AdapterHarness([(frame, frame[:, :, 0]) for frame in frames])
+        def advance():
+            harness.clock += step
+        harness.before_return = advance
+        return harness
+
+    def test_sixty_usable_frames_survive_ir_off_pulses_and_dark_frames(self):
+        frames = [self.black, self.dark, self.lit] * 60
+        harness = self.harness(frames)
+        seen = []
+        harness.run(lambda capture: seen.extend(capture.read_frame() for _ in range(60)),
+                    enrollment=True)
+        self.assertEqual(harness.reads, 180)
+        for result in seen:
+            self.assertIs(result[0], self.lit)
+
+    def test_black_and_dark_streams_fail_within_wall_clock_limit(self):
+        for frame, reason in ((self.black, "only black"), (self.dark, "too dark")):
+            with self.subTest(reason=reason):
+                harness = self.harness([frame] * 40, step=1)
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    harness.run(lambda capture: capture.read_frame(), enrollment=True)
+                self.assertLessEqual(harness.clock, 30)
+
+    def test_frame_must_return_before_deadline_to_be_enrolled(self):
+        for elapsed in (29.99, 30.0, 31.0):
+            with self.subTest(elapsed=elapsed):
+                harness = self.harness([self.lit], step=elapsed)
+                if elapsed < 30:
+                    seen = []
+                    harness.run(lambda capture: seen.append(capture.read_frame()), enrollment=True)
+                    self.assertIs(seen[0][0], self.lit)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "timed out"):
+                        harness.run(lambda capture: capture.read_frame(), enrollment=True)
+
+    def test_darkness_equal_to_threshold_is_usable(self):
+        harness = self.harness([self.dark])
+        harness.config.set("video", "dark_threshold", str(expected_darkness(self.dark)))
+        seen = []
+        harness.run(lambda capture: seen.append(capture.read_frame()), enrollment=True)
+        self.assertIs(seen[0][0], self.dark)
+
+    def test_cancel_while_skipping_dark_frames_aborts_before_next_sample(self):
+        harness = self.harness([self.black] * 5)
+        def cancel_after_two():
+            harness.clock += 1 / 15
+            if harness.reads == 2:
+                harness.cancel()
+        harness.before_return = cancel_after_two
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            harness.run(lambda capture: capture.read_frame(), enrollment=True)
+        self.assertEqual(harness.reads, 2)
+
+    def test_skipped_frames_do_not_change_howdy_rotation_parity(self):
+        harness = self.harness([self.black, self.lit, self.black, self.lit])
+        harness.config.set("video", "rotate", "1")
+        harness.run(lambda capture: [capture.read_frame(), capture.read_frame()], enrollment=True)
+        self.assertEqual(harness.rotations, [(1, 1), (1, 1), (1, 2), (1, 2)])
+
+
+class EnrollmentRollbackTest(unittest.TestCase):
+    def test_five_sample_budget_and_partial_failure_rollback(self):
+        functions = [node for node in ast.parse(HELPER.read_text()).body
+                     if isinstance(node, ast.FunctionDef)
+                     and node.name in ("require", "rollback", "prepare")]
+        original_config = "[video]\n[core]\n[snapshots]\n"
+        for outcome in ("cancelled", "timeout"):
+            for existing in (False, True):
+                with self.subTest(outcome=outcome, existing_model=existing), \
+                        tempfile.TemporaryDirectory() as directory:
+                    config_dir = Path(directory)
+                    (config_dir / "models").mkdir()
+                    (config_dir / "config.ini").write_text(original_config)
+                    model = config_dir / "models/example.dat"
+                    if existing:
+                        model.write_bytes(b"original private model")
+                    clock = types.SimpleNamespace(value=0.0)
+                    samples = []
+
+                    def enroll(*args, **kwargs):
+                        remaining = kwargs["timeout"]
+                        samples.append(remaining)
+                        model.write_bytes(b"replacement model")
+                        duration = 31.0 if outcome == "timeout" else 10.0
+                        clock.value += min(duration, remaining)
+                        if duration > remaining:
+                            raise subprocess.TimeoutExpired(args, remaining)
+                        if outcome == "cancelled" and len(samples) == 3:
+                            raise RuntimeError("sample cancelled")
+
+                    namespace = dict(
+                        CONF=config_dir, TRANSACTION=config_dir / ".onboarding",
+                        BASE=Path("/unused"), RUNTIME=Path("/unused"), json=json,
+                        shutil=shutil, configparser=configparser,
+                        time=types.SimpleNamespace(monotonic=lambda: clock.value),
+                        pwd=types.SimpleNamespace(getpwnam=lambda user:
+                            types.SimpleNamespace(pw_uid=1000, pw_gid=os.getgid())),
+                        sys=types.SimpleNamespace(argv=["installer", "prepare", "example", "1000"],
+                                                  stderr=io.StringIO()),
+                        os=types.SimpleNamespace(umask=os.umask, chmod=os.chmod, chown=lambda *args: None),
+                        trusted=lambda path: path, configure=lambda: False,
+                        camera=lambda: ("/dev/null", ""), desktop_camera_access=lambda *args: None,
+                        ENROLLMENT_PREVIEW=ADAPTER, run=enroll)
+                    exec(compile(ast.Module(body=functions, type_ignores=[]), str(HELPER), "exec"), namespace)
+                    error = subprocess.TimeoutExpired if outcome == "timeout" else RuntimeError
+                    with self.assertRaises(error):
+                        namespace["prepare"]("example", os.getpid())
+                    self.assertEqual((config_dir / "config.ini").read_text(), original_config)
+                    self.assertFalse((config_dir / ".onboarding").exists())
+                    if existing:
+                        self.assertEqual(model.read_bytes(), b"original private model")
+                    else:
+                        self.assertFalse(model.exists())
+                    self.assertLessEqual(clock.value, 90.0)
 
 
 class PreviewSupervisorTest(unittest.TestCase):
