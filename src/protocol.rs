@@ -141,7 +141,9 @@ impl<'de> serde::Deserialize<'de> for SerializableOsString {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq,
+)]
 pub struct Environment {
     tty: Option<SerializableOsString>,
     env_vars: Vec<(SerializableOsString, SerializableOsString)>,

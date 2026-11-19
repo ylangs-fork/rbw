@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.17.5] - 2026-11-19
+
+### Fixed
+
+* Authorize a CLI decryption command once instead of prompting for every
+  encrypted field inspected during name lookup. A new command still requires a
+  fresh notification and face check; approvals are connection-local and become
+  invalid on lock, session reload, expiry, policy failure or connection error.
+* Keep buffered decryption requests intact and fail a rejected command without
+  reconnecting and prompting again.
+
 ## [1.17.4] - 2026-11-19
 
 ### Changed

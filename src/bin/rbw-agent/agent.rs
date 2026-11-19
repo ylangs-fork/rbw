@@ -8,6 +8,11 @@ pub struct Agent {
     memory_guard: crate::memory_guard::MemoryGuard,
 }
 
+struct DecryptionAuthorization {
+    environment: rbw::protocol::Environment,
+    cancellation: crate::state::Cancellation,
+}
+
 impl Agent {
     pub fn new(
         timer_r: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -75,22 +80,31 @@ impl Agent {
                     let state = self.state.clone();
                     let memory_guard = self.memory_guard.clone();
                     tokio::spawn(async move {
-                        let res = Box::pin(handle_request(
-                            &mut sock,
-                            state.clone(),
-                            &memory_guard,
-                        ))
-                        .await;
-                        if let Err(e) = res {
-                            if let Err(error) = sock
-                                .send(&rbw::protocol::Response::Error {
-                                    error: format!("{e:#}"),
-                                })
-                                .await
+                        let mut authorization = None;
+                        loop {
+                            match Box::pin(handle_request(
+                                &mut sock,
+                                state.clone(),
+                                &memory_guard,
+                                &mut authorization,
+                            ))
+                            .await
                             {
-                                log::debug!(
-                                    "client disconnected before agent error response: {error:#}"
-                                );
+                                Ok(true) => continue,
+                                Ok(false) => break,
+                                Err(e) => {
+                                    if let Err(error) = sock
+                                        .send(&rbw::protocol::Response::Error {
+                                            error: format!("{e:#}"),
+                                        })
+                                        .await
+                                    {
+                                        log::debug!(
+                                            "client disconnected before agent error response: {error:#}"
+                                        );
+                                    }
+                                    break;
+                                }
                             }
                         }
                     });
@@ -121,21 +135,19 @@ async fn handle_request(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     memory_guard: &crate::memory_guard::MemoryGuard,
-) -> anyhow::Result<()> {
-    let req = sock.recv().await?;
-    let req = match req {
-        Ok(msg) => msg,
-        Err(error) => {
-            sock.send(&rbw::protocol::Response::Error { error }).await?;
-            return Ok(());
-        }
+    authorization: &mut Option<DecryptionAuthorization>,
+) -> anyhow::Result<bool> {
+    let Some(req) = sock.recv().await? else {
+        return Ok(false);
     };
     let (action, environment) = req.into_parts();
     // RAM defense: reject/abort if the agent is being traced (C3/C4).
     // Covers all actions; cost is one small procfs read.
     memory_guard.enforce(&state).await?;
-    // Sensitive actions require a fresh bio (re)authorization (B3).
-    if sensitive_action(&action) {
+    let decryption = matches!(&action, rbw::protocol::Action::Decrypt { .. });
+    if decryption {
+        authorize_decryption(state.clone(), &environment, authorization).await?;
+    } else if sensitive_action(&action) {
         gate_sensitive_action(state.clone(), &environment).await?;
     }
     match &action {
@@ -205,6 +217,10 @@ async fn handle_request(
                 sock,
                 state.clone(),
                 &environment,
+                &authorization
+                    .as_ref()
+                    .context("missing decryption authorization")?
+                    .cancellation,
                 &cipherstring,
                 entry_key.as_deref(),
                 org_id.as_deref(),
@@ -234,7 +250,7 @@ async fn handle_request(
     state.record_activity();
     state.set_last_environment(environment);
 
-    Ok(())
+    Ok(decryption)
 }
 
 fn sensitive_action(action: &rbw::protocol::Action) -> bool {
@@ -244,10 +260,43 @@ fn sensitive_action(action: &rbw::protocol::Action) -> bool {
     )
 }
 
+async fn authorize_decryption(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    authorization: &mut Option<DecryptionAuthorization>,
+) -> anyhow::Result<()> {
+    if let Some(authorization) = authorization {
+        anyhow::ensure!(
+            authorization.environment == *environment,
+            "decryption authorization context changed"
+        );
+        let mut state = state.lock().await;
+        anyhow::ensure!(
+            !authorization.cancellation.is_cancelled(),
+            "decryption authorization was invalidated"
+        );
+        if !state.l1_alive() {
+            state.clear();
+            anyhow::bail!("agent is locked");
+        }
+        if state.pam_gate_required() {
+            // Revalidate policy trust without prompting again for each field.
+            rbw::pam_gate::PamGate::new()?;
+        }
+        return Ok(());
+    }
+    let cancellation = gate_sensitive_action(state, environment).await?;
+    *authorization = Some(DecryptionAuthorization {
+        environment: environment.clone(),
+        cancellation,
+    });
+    Ok(())
+}
+
 pub async fn gate_sensitive_action(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::state::Cancellation> {
     let (pam_gate_required, mut cancellation) = {
         let mut state = state.lock().await;
         if !state.l1_alive() {
@@ -258,7 +307,7 @@ pub async fn gate_sensitive_action(
     };
 
     if !pam_gate_required {
-        return Ok(());
+        return Ok(cancellation);
     }
 
     // The mode was selected at startup. Revalidate the policy for every
@@ -292,7 +341,7 @@ pub async fn gate_sensitive_action(
         ));
     }
     state.record_bio_success();
-    Ok(())
+    Ok(cancellation)
 }
 
 #[cfg(test)]

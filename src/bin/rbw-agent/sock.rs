@@ -1,11 +1,11 @@
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-pub struct Sock(tokio::net::UnixStream);
+pub struct Sock(tokio::io::BufReader<tokio::net::UnixStream>);
 
 impl Sock {
     pub fn new(s: tokio::net::UnixStream) -> Self {
-        Self(s)
+        Self(tokio::io::BufReader::new(s))
     }
 
     pub async fn send(
@@ -17,6 +17,7 @@ impl Sock {
         }
 
         let Self(sock) = self;
+        let sock = sock.get_mut();
         sock.write_all(
             serde_json::to_string(res)
                 .context("failed to serialize message")?
@@ -32,16 +33,19 @@ impl Sock {
 
     pub async fn recv(
         &mut self,
-    ) -> anyhow::Result<std::result::Result<rbw::protocol::Request, String>>
-    {
+    ) -> anyhow::Result<Option<rbw::protocol::Request>> {
         let Self(sock) = self;
-        let mut buf = tokio::io::BufStream::new(sock);
         let mut line = String::new();
-        buf.read_line(&mut line)
+        if sock
+            .read_line(&mut line)
             .await
-            .context("failed to read message from socket")?;
-        Ok(serde_json::from_str(&line)
-            .map_err(|e| format!("failed to parse message '{line}': {e}")))
+            .context("failed to read message from socket")? == 0
+        {
+            return Ok(None);
+        }
+        serde_json::from_str(&line)
+            .map(Some)
+            .context("failed to parse request")
     }
 }
 
