@@ -12,17 +12,24 @@
 <body>
   <main>
     <header><h1>Face setup</h1><span>rbwBio · local enrollment preview</span></header>
-    <section class="view" aria-label="Face setup camera and verification status">
-      <p>Waiting for your IR camera…</p>
-      <img id="camera" alt="Live infrared camera frame" hidden>
+    <section class="view" aria-label="Live RGB camera preview for positioning">
+      <video id="camera" autoplay playsinline muted hidden aria-label="Live RGB camera preview, mirrored"></video>
+      <p id="view-note">Waiting for camera permission…</p>
+      <span id="view-tag" class="tag" hidden>RGB preview · positioning only</span>
     </section>
+    <p id="camera-label" class="muted" hidden></p>
+    <div id="camera-issue" class="issue" role="alert" hidden>
+      <strong id="issue-title"></strong>
+      <p id="issue-detail"></p>
+    </div>
     <section class="panel" aria-live="polite">
-      <h2 id="status">Waiting for camera</h2>
-      <p id="detail">Keep this page open through enrollment and real face verification.</p>
-      <p id="meter" class="muted">Darkness — · threshold —</p>
+      <p class="eyebrow">IR recognition</p>
+      <h2 id="status">Waiting for camera preview</h2>
+      <p id="detail">Allow camera access when your browser asks. Keep this page open through enrollment and real face verification.</p>
+      <p id="meter" class="muted">IR darkness — · limit —</p>
     </section>
     <footer>
-      <span class="muted">Preview frames stay in memory on this computer and are never saved or uploaded.</span>
+      <span class="muted">The color preview stays inside this browser tab and is never recorded or uploaded. Face recognition uses only the IR camera.</span>
       <button id="cancel" type="button">Cancel</button>
     </footer>
   </main>

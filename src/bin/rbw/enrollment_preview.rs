@@ -1,4 +1,4 @@
-//! Ephemeral, ordinary-user-only enrollment display. Never opens the camera.
+//! Ephemeral IR telemetry and browser-local RGB display. The server opens no camera.
 
 use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
@@ -12,102 +12,15 @@ use axum::response::Response;
 use base64::Engine as _;
 use rand::TryRngCore as _;
 
-pub(super) const MAX_LINE: usize = 512 * 1024;
-const MAX_JPEG: usize = 200 * 1024;
+pub(super) const MAX_LINE: usize = 4096;
 pub(super) const PREFIX: &[u8] = b"RBWBIO_PREVIEW ";
 const HTML: &str = include_str!("enrollment_preview.html");
-const SCRIPT: &str = r#"'use strict';
-const image = document.querySelector('#camera');
-const status = document.querySelector('#status');
-const detail = document.querySelector('#detail');
-const meter = document.querySelector('#meter');
-const cancel = document.querySelector('#cancel');
-const placeholder = document.querySelector('.view p');
-let ended = false;
-function clearCamera(message) {
-  image.removeAttribute('src'); image.hidden = true;
-  placeholder.textContent = message;
-  status.dataset.warning = 'false'; meter.textContent = '—';
-}
-async function finish(frame) {
-  ended = true; clearCamera('Camera closed');
-  status.textContent = frame.status === 'complete' ? 'Face authorization enabled' :
-    frame.status === 'cancelled' ? 'Face setup cancelled' : 'Face setup failed';
-  detail.textContent = frame.reason;
-  cancel.disabled = true;
-  // Acknowledge only after applying the final result, never a live frame.
-  await new Promise(resolve => window.requestAnimationFrame(resolve));
-  try { await fetch('ack', {method: 'POST', credentials: 'omit', cache: 'no-store'}); } catch (_) {}
-}
-async function poll() {
-  try {
-    const response = await fetch('state', {cache: 'no-store', credentials: 'omit'});
-    if (!response.ok) throw new Error('disconnected');
-    const frame = await response.json();
-    if (ended) return;
-    if (['complete', 'failed', 'cancelled'].includes(frame.status)) {
-      await finish(frame); return;
-    }
-    if (frame.status === 'verifying') {
-      clearCamera('PAM is using its own camera; live preview is stopped.');
-      status.textContent = 'Verifying face';
-      detail.textContent = 'Look directly at the IR camera. Keep this page open while real face verification and activation finish.';
-    } else if (frame.status === 'cancelling') {
-      clearCamera('Camera closing');
-      status.textContent = 'Cancelling face setup';
-      detail.textContent = 'Waiting for enrollment or verification to stop and changes to be rolled back.';
-      cancel.disabled = true;
-    } else if (frame.jpeg) {
-      image.src = 'data:image/jpeg;base64,' + frame.jpeg; image.hidden = false;
-      const dark = frame.darkness > frame.threshold;
-      status.textContent = dark ? 'Too dark' : 'Camera active';
-      status.dataset.warning = String(dark);
-      detail.textContent = dark ? 'Face the IR camera and move closer. Enrollment is waiting for a usable frame.' : 'Keep your face centered and look into the IR camera.';
-      meter.textContent = frame.darkness.toFixed(1) + '% dark · limit ' + frame.threshold.toFixed(1) + '%';
-    }
-  } catch (_) {
-    if (!ended) {
-      ended = true; clearCamera('Camera closed');
-      status.textContent = 'Preview disconnected';
-      detail.textContent = 'Check your terminal for the actual face setup result.';
-      cancel.disabled = true;
-    }
-    return;
-  }
-  if (!ended) window.setTimeout(poll, 100);
-}
-cancel.addEventListener('click', async () => {
-  cancel.disabled = true;
-  clearCamera('Camera closing');
-  try {
-    const response = await fetch('cancel', {method: 'POST', credentials: 'omit', cache: 'no-store'});
-    if (!response.ok) throw new Error('cancel failed');
-  } catch (_) {
-    detail.textContent = 'Cancellation could not be confirmed. Check your terminal.';
-  }
-});
-window.addEventListener('pagehide', () => { image.removeAttribute('src'); });
-poll();
-"#;
-const STYLE: &str = r#"
-:root{color-scheme:dark;font:16px/1.5 system-ui,sans-serif;background:#141516;color:#e5e7eb}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
-main{width:min(100%,780px)}header{display:flex;justify-content:space-between;align-items:center;gap:16px}
-h1{font-size:1.55rem;font-weight:600;margin:0}header span,.muted{color:#a2a6ad;font-size:.9rem}
-.view{margin:24px 0;background:#0a0b0c;border:1px solid #34363b;border-radius:16px;aspect-ratio:4/3;display:grid;place-items:center;overflow:hidden;position:relative}
-.view p{color:#737780;position:absolute}.view img{width:100%;height:100%;object-fit:contain;position:relative}
-.panel{border:1px solid #34363b;border-radius:12px;background:#1c1e21;padding:20px}
-h2{font-size:1.1rem;margin:0 0 6px}h2[data-warning=true]{color:#f3c783}p{margin:6px 0}
-footer{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-top:20px}
-button{font:inherit;border:1px solid #555b63;background:#292d32;color:#eee;border-radius:8px;padding:9px 22px;cursor:pointer}
-button:hover{background:#363c43}button:focus-visible{outline:2px solid #cbd5e1;outline-offset:3px}button:disabled{opacity:.45;cursor:default}
-@media(max-width:480px){body{padding:16px}header,footer{align-items:flex-start;flex-direction:column}.view{margin:18px 0}.panel{padding:16px}}
-"#;
+const SCRIPT: &str = include_str!("enrollment_preview.js");
+const STYLE: &str = include_str!("enrollment_preview.css");
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Frame {
-    jpeg: String,
     darkness: f64,
     threshold: f64,
 }
@@ -118,6 +31,7 @@ struct Content {
     cancelled: bool,
     finished: bool,
     page_ready: bool,
+    camera_ready: bool,
     verifying: bool,
     final_seen: bool,
     final_acknowledged: bool,
@@ -162,6 +76,7 @@ pub(super) fn start(open_browser: bool) -> anyhow::Result<Preview> {
             finished: false,
             page_ready: false,
             verifying: false,
+            camera_ready: false,
             final_seen: false,
             final_acknowledged: false,
         }),
@@ -202,13 +117,17 @@ pub(super) fn start(open_browser: bool) -> anyhow::Result<Preview> {
             open::that_detached(preview.url())
                 .context("enrollment preview unavailable: cannot launch the default browser")?;
             eprintln!("Opening the enrollment preview in your default browser...");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
-                let ready = preview.shared.content.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner).page_ready;
+                let (ready, cancelled) = {
+                    let content = preview.shared.content.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (content.camera_ready, content.cancelled)
+                };
+                ensure!(!cancelled, "face setup was cancelled before enrollment");
                 if ready { break; }
                 ensure!(std::time::Instant::now() < deadline,
-                    "the enrollment preview did not connect within 15 seconds; check your default browser and try again (no camera enrollment was started)");
+                    "the RGB preview did not become ready within 60 seconds; check browser camera permission (no IR enrollment was started)");
                 ensure!(!preview.server.as_ref().is_some_and(JoinHandle::is_finished),
                     "the enrollment preview server stopped before the browser connected");
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -259,11 +178,6 @@ impl Preview {
         ensure!(frame.darkness.is_finite() && (0.0..=100.0).contains(&frame.darkness)
             && frame.threshold.is_finite() && (0.0..=100.0).contains(&frame.threshold),
             "invalid enrollment preview darkness or threshold");
-        ensure!(frame.jpeg.len() <= MAX_JPEG.div_ceil(3) * 4, "enrollment preview JPEG is too large");
-        let jpeg = base64::engine::general_purpose::STANDARD.decode(&frame.jpeg)
-            .context("invalid enrollment preview JPEG encoding")?;
-        ensure!(jpeg.len() <= MAX_JPEG && jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9]),
-            "invalid enrollment preview JPEG");
         #[derive(serde::Serialize)]
         struct Snapshot<'a> { status: &'static str, #[serde(flatten)] frame: &'a Frame }
         let snapshot = Bytes::from(serde_json::to_vec(&Snapshot { status: "active", frame: &frame })?);
@@ -337,6 +251,14 @@ async fn handle(State(shared): State<Arc<Shared>>, method: Method, uri: Uri, hea
             };
             response(StatusCode::OK, "application/json", snapshot)
         }
+        (Method::POST, "ready") if origin == Some(shared.origin.as_str()) => {
+            let mut content = shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if content.cancelled || content.finished {
+                return response(StatusCode::CONFLICT, "text/plain", Bytes::new());
+            }
+            content.camera_ready = true;
+            response(StatusCode::NO_CONTENT, "text/plain", Bytes::new())
+        }
         (Method::POST, "cancel") if origin == Some(shared.origin.as_str()) => {
             let mut content = shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !content.finished {
@@ -366,7 +288,8 @@ fn response(status: StatusCode, content_type: &'static str, bytes: Bytes) -> Res
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, content_type.parse().expect("static content type"));
     headers.insert(header::CACHE_CONTROL, "no-store, max-age=0".parse().expect("static header"));
-    headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().expect("static CSP"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'none'; script-src 'self'; style-src 'self'; media-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().expect("static CSP"));
+    headers.insert("permissions-policy", "camera=(self), microphone=()".parse().expect("static permissions policy"));
     headers.insert("referrer-policy", "no-referrer".parse().expect("static header"));
     headers.insert("x-content-type-options", "nosniff".parse().expect("static header"));
     headers.insert("cross-origin-resource-policy", "same-origin".parse().expect("static header"));
@@ -418,7 +341,7 @@ mod tests {
         assert_eq!(protocol.line.len(), MAX_LINE);
         let mut protocol = Protocol::default();
         protocol.feed(b"RBWBIO_PRE", &preview)?;
-        protocol.feed(b"VIEW {\"jpeg\":\"/9j/2Q==\",\"darkness\":71.6,\"threshold\":60}\n/dev/video0\n", &preview)?;
+        protocol.feed(b"VIEW {\"darkness\":71.6,\"threshold\":60}\n/dev/video0\n", &preview)?;
         assert_eq!(protocol.finish()?, b"/dev/video0\n");
         Ok(())
     }
@@ -437,20 +360,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "no-store, max-age=0");
         assert!(!response.headers().contains_key("access-control-allow-origin"));
+        // Reading status while permission is pending must not start IR capture.
+        assert!(!preview.shared.content.lock().unwrap().camera_ready);
+        let ready = format!("{}ready", preview.url());
+        assert_eq!(client.post(&ready).send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(&ready).header("Origin", "https://evil.invalid").send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(&ready).header("Origin", &preview.shared.origin).send()?.status(), StatusCode::NO_CONTENT);
+        assert!(preview.shared.content.lock().unwrap().camera_ready);
         assert!(preview.ingest(&vec![b'x'; MAX_LINE + 1]).is_err());
-        assert!(preview.ingest(br#"{"jpeg":"/9j/2Q==","darkness":101,"threshold":60}"#).is_err());
-        assert!(preview.ingest(br#"{"jpeg":"eA==","darkness":50,"threshold":60}"#).is_err());
-        preview.ingest(br#"{"jpeg":"/9j/2Q==","darkness":71.6,"threshold":60}"#)?;
+        assert!(preview.ingest(br#"{"darkness":101,"threshold":60}"#).is_err());
+        assert!(preview.ingest(br#"{"darkness":50,"threshold":-1}"#).is_err());
+        preview.ingest(br#"{"darkness":71.6,"threshold":60}"#)?;
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["darkness"], 71.6);
-        assert!(preview.ingest(&serde_json::to_vec(&Frame { jpeg: base64::engine::general_purpose::STANDARD.encode(vec![0_u8; MAX_JPEG + 1]), darkness: 1.0, threshold: 60.0 })?).is_err());
+        assert!(preview.ingest(br#"{"darkness":50,"threshold":60,"unexpected":true}"#).is_err());
         Ok(())
     }
 
     #[test]
     fn cancel_closes_child_stdin_and_erases_frame() -> anyhow::Result<()> {
         let preview = start(false)?;
-        preview.ingest(br#"{"jpeg":"/9j/2Q==","darkness":71.6,"threshold":60}"#)?;
+        preview.ingest(br#"{"darkness":71.6,"threshold":60}"#)?;
         let mut child = std::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn()?;
         preview.bind_child_stdin(child.stdin.take().context("missing child stdin")?);
@@ -469,18 +399,19 @@ mod tests {
         assert!(preview.cancelled());
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["status"], "cancelling");
-        assert!(state.get("jpeg").is_none());
+        assert!(state.get("darkness").is_none());
+        assert_eq!(client.post(format!("{}ready", preview.url())).header("Origin", &preview.shared.origin).send()?.status(), StatusCode::CONFLICT);
         preview.finish("failed", "Enrollment failed.");
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["status"], "cancelled");
-        assert!(state.get("jpeg").is_none());
+        assert!(state.get("darkness").is_none());
         Ok(())
     }
 
     #[test]
     fn verifying_erases_frames_and_keeps_server_available() -> anyhow::Result<()> {
         let preview = start(false)?;
-        let frame = br#"{"jpeg":"/9j/2Q==","darkness":20,"threshold":60}"#;
+        let frame = br#"{"darkness":20,"threshold":60}"#;
         preview.ingest(frame)?;
         preview.verifying();
         // A late recorder frame must not masquerade as the PAM camera.
@@ -488,7 +419,7 @@ mod tests {
         let client = reqwest::blocking::Client::builder().no_proxy().build()?;
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["status"], "verifying");
-        assert!(state.get("jpeg").is_none());
+        assert!(state.get("darkness").is_none());
         assert!(!preview.shared.content.lock().unwrap().finished);
         let response = client.post(format!("{}cancel", preview.url()))
             .header("Origin", &preview.shared.origin).send()?;
@@ -510,7 +441,7 @@ mod tests {
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["status"], "failed");
         assert_eq!(state["reason"], "Face verification timed out.");
-        assert!(state.get("jpeg").is_none());
+        assert!(state.get("darkness").is_none());
         assert_eq!(client.post(&ack).send()?.status(), StatusCode::NOT_FOUND);
         assert_eq!(client.post(&ack).header("Origin", "https://evil.invalid").send()?.status(), StatusCode::NOT_FOUND);
         assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin)
