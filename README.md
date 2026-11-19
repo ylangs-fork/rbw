@@ -186,6 +186,13 @@ System deployment requests administrator authorization, but never runs apt,
 pip, a compiler, or a network download. Missing precompiled components fail
 explicitly instead of falling back to a build on your laptop.
 
+During desktop enrollment, the default browser opens a local live IR preview
+with the darkness percentage and rejection threshold. It displays the same
+frames used for enrollment, not a second camera stream. Use Cancel to abort;
+frames are kept only in memory, never saved or sent to an external service.
+Closing the enrollment process stops the local preview. A terminal without a
+desktop display reports that a preview is unavailable.
+
 Enrollment is offered only with interactive input/output; pipelines never prompt.
 Use `rbw setup --apply` to opt in later or repair enrollment. `rbw setup` and
 `rbw setup --check` remain read-only diagnostics. No sudo/login PAM policy is
