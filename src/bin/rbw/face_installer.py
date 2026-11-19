@@ -11,6 +11,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import select
+import signal
+import time
 
 
 RUNTIME = Path("/usr/lib/security/rbw-howdy/runtime")
@@ -20,6 +23,96 @@ MODULE = BASE / "pam_howdy.so"
 TRANSACTION = CONF / ".onboarding"
 ENV = {"PATH": str(RUNTIME / "bin") + ":/usr/sbin:/usr/bin:/sbin:/bin",
        "HOME": "/root", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"}
+
+# Executed only by the authenticated private interpreter, never from a user file.
+# Tap Howdy's existing recorder; do not open another camera or alter its frames.
+ENROLLMENT_PREVIEW = r"""
+import base64
+import json
+import os
+import runpy
+import select
+import sys
+import time
+
+protocol = sys.stdout
+sys.stdout = sys.stderr
+HOWDY = "/usr/lib/security/rbw-howdy/howdy"
+if HOWDY not in sys.path:
+    sys.path.insert(0, HOWDY)
+
+# Match add.py's import order for the bundled native libraries.
+import dlib
+import cv2
+from recorders.video_capture import VideoCapture
+from rotation import rotate_frame
+
+
+def check_cancelled():
+    descriptor = sys.stdin.fileno()
+    if select.select([descriptor], [], [], 0)[0] and os.read(descriptor, 1) == b"":
+        raise RuntimeError("face enrollment cancelled")
+
+
+original_read_frame = VideoCapture.read_frame
+
+
+def preview_read_frame(self):
+    check_cancelled()
+    result = original_read_frame(self)
+    check_cancelled()
+    frame_number = getattr(self, "_rbw_preview_frame_number", 0) + 1
+    self._rbw_preview_frame_number = frame_number
+    now = time.monotonic()
+    if now - getattr(self, "_rbw_preview_last_frame", float("-inf")) < 0.1:
+        return result
+    # Rotation modes 1/2 depend on every read, including unpreviewed frames.
+    frame = rotate_frame(result[0], self.config.getint("video", "rotate", fallback=0),
+                         frame_number)
+    grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if not hasattr(self, "_rbw_preview_clahe"):
+        self._rbw_preview_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    histogram = cv2.calcHist([self._rbw_preview_clahe.apply(grayscale)],
+                             [0], None, [8], [0, 256])
+    darkness = float(histogram[0, 0] / histogram.sum() * 100)
+    threshold = self.config.getfloat("video", "dark_threshold", fallback=60.0)
+
+    # Display the source IR image, not the contrast-enhanced recognition input.
+    height, width = frame.shape[:2]
+    scale = min(1.0, 640 / width, 480 / height)
+    if scale < 1:
+        frame = cv2.resize(frame, (max(1, int(width * scale)),
+                                   max(1, int(height * scale))),
+                           interpolation=cv2.INTER_AREA)
+    while True:
+        success, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if not success:
+            raise RuntimeError("cannot encode face enrollment preview")
+        if jpeg.size <= 200 * 1024:
+            break
+        height, width = frame.shape[:2]
+        if height == width == 1:
+            raise RuntimeError("face enrollment preview exceeds size limit")
+        frame = cv2.resize(frame, (max(1, width // 2), max(1, height // 2)),
+                           interpolation=cv2.INTER_AREA)
+    message = "RBWBIO_PREVIEW " + json.dumps(
+        {"jpeg": base64.b64encode(jpeg).decode("ascii"),
+         "darkness": darkness, "threshold": threshold},
+        separators=(",", ":"), allow_nan=False)
+    if len(message) + 1 > 512 * 1024:
+        raise RuntimeError("face enrollment preview exceeds protocol limit")
+    print(message, file=protocol, flush=True)
+    self._rbw_preview_last_frame = time.monotonic()
+    return result
+
+
+VideoCapture.read_frame = preview_read_frame
+sys.argv = [HOWDY + "/cli.py"] + sys.argv[1:]
+check_cancelled()
+runpy.run_path(HOWDY + "/cli.py", run_name="__main__")
+# A cancellation during encoding/model writing must still roll the model back.
+check_cancelled()
+"""
 
 
 def require(condition, message):
@@ -41,11 +134,45 @@ def trusted(path):
     return resolved
 
 
-def run(*args, timeout=1200, capture=False, cwd=None):
+def run(*args, timeout=1200, capture=False, cwd=None, preview=False):
     trusted(args[0])
-    return subprocess.run(args, check=True, env=ENV, stdin=sys.stdin,
-                          stdout=subprocess.PIPE if capture else sys.stderr,
-                          stderr=sys.stderr, timeout=timeout, text=capture, cwd=cwd).stdout
+    if not preview:
+        return subprocess.run(args, check=True, env=ENV, stdin=sys.stdin,
+                              stdout=subprocess.PIPE if capture else sys.stderr,
+                              stderr=sys.stderr, timeout=timeout, text=capture, cwd=cwd).stdout
+    # The privileged supervisor watches cancellation independently of camera
+    # reads. A blocked driver must not leave a recorder or its children alive.
+    with subprocess.Popen(args, env=ENV, stdin=sys.stdin, stdout=sys.stdout,
+                          stderr=sys.stderr, cwd=cwd, start_new_session=True) as child:
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if select.select([sys.stdin], [], [], 0)[0] and os.read(sys.stdin.fileno(), 1) == b"":
+                    raise RuntimeError("face enrollment cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    status = child.wait(timeout=min(0.05, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+            if status:
+                raise subprocess.CalledProcessError(status, args)
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+            raise
 
 
 def configure():
@@ -204,8 +331,10 @@ def prepare(user, owner_pid):
             config.write(output)
         old_umask = os.umask(0o077)
         try:
-            run(str(RUNTIME / "bin/python3"), "-B", "-s", "-E", str(BASE / "howdy" / "cli.py"),
-                "-U", user, "-y", "add", "rbw face", timeout=90)
+            trusted(BASE / "howdy")
+            trusted(BASE / "howdy" / "cli.py")
+            run(str(RUNTIME / "bin/python3"), "-B", "-s", "-E", "-c", ENROLLMENT_PREVIEW,
+                "-U", user, "-y", "add", "rbw face", timeout=90, preview=True)
         finally:
             os.umask(old_umask)
         trusted(model)

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.17.2] - 2026-11-19
+
+### Added
+
+* Desktop face enrollment opens a live IR preview in the default browser,
+  showing the actual enrollment frames, darkness percentage and threshold.
+  Preview is local, ephemeral and does not save photos or open another camera.
+* Cancelling from the preview aborts enrollment through the existing rollback
+  path. Recognition thresholds and the published face runtime are unchanged.
+
 ## [1.17.1] - 2026-11-19
 
 ### Changed

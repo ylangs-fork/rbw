@@ -4,6 +4,10 @@ use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::Context as _;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "enrollment_preview.rs"]
+mod enrollment_preview;
+
 pub fn run(apply: bool) -> anyhow::Result<()> {
     if apply {
         anyhow::ensure!(interactive(), "face setup requires an interactive terminal in your local desktop session");
@@ -207,7 +211,7 @@ mod linux {
             } else {
                 let installer =
                     installer.as_ref().context("installer not staged")?;
-                let output = installer.invoke("prepare", &user)?;
+                let output = installer.prepare(&user)?;
                 prepared = true;
                 let device = std::str::from_utf8(&output.stdout)?.trim();
                 ensure!(
@@ -805,6 +809,127 @@ mod linux {
             Ok(installer)
         }
 
+        fn prepare(&self, user: &str) -> anyhow::Result<std::process::Output> {
+            use std::os::fd::AsRawFd as _;
+            use std::time::{Duration, Instant};
+
+            use super::enrollment_preview;
+
+            // A graphical browser must connect before Howdy's short recording
+            // window starts. Headless enrollment remains a terminal operation.
+            let preview = enrollment_preview::start(true)?;
+            ensure!(!preview.cancelled(), "face enrollment was cancelled");
+            let uid = rustix::process::geteuid().as_raw().to_string();
+            let pid = std::process::id().to_string();
+            let mut command = privileged_command(
+                "/usr/lib/security/rbw-howdy/runtime/bin/python3",
+                &[
+                    "-I".as_ref(), "-B".as_ref(),
+                    self.snapshot.as_os_str(), "prepare".as_ref(),
+                    user.as_ref(), uid.as_ref(), pid.as_ref(),
+                ],
+            )?;
+            // sudo reads passwords from /dev/tty, never from this EOF channel.
+            let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped())
+                .stderr(Stdio::inherit()).spawn()
+                .context("cannot start controlled face enrollment")?;
+            let mut stdout = child.stdout.take();
+            let mut nonblocking = false;
+            let mut exit_status = None;
+            let mut result = (|| -> anyhow::Result<std::process::Output> {
+                preview.bind_child_stdin(child.stdin.take().context("missing enrollment stdin")?);
+                let stdout = stdout.as_mut().context("missing enrollment stdout")?;
+                // SAFETY: stdout owns this live pipe descriptor. Preserve all
+                // existing descriptor flags and only enable nonblocking reads.
+                let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+                ensure!(flags >= 0, "cannot inspect enrollment pipe flags: {}", std::io::Error::last_os_error());
+                let updated = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                ensure!(updated >= 0, "cannot configure enrollment pipe: {}", std::io::Error::last_os_error());
+                nonblocking = true;
+                let mut protocol = enrollment_preview::Protocol::default();
+                let mut buffer = [0_u8; 8192];
+                let mut eof = false;
+                let mut cancellation = None;
+                loop {
+                    let mut received = false;
+                    if !eof {
+                        match stdout.read(&mut buffer) {
+                            Ok(0) => eof = true,
+                            Ok(count) => {
+                                protocol.feed(&buffer[..count], &preview)?;
+                                received = true;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(error).context("cannot read enrollment preview"),
+                        }
+                    }
+                    if preview.cancelled() {
+                        let since = cancellation.get_or_insert_with(Instant::now);
+                        ensure!(since.elapsed() < Duration::from_secs(5),
+                            "face enrollment did not stop after cancellation");
+                    }
+                    if exit_status.is_none() { exit_status = child.try_wait()?; }
+                    if eof {
+                        if let Some(status) = exit_status {
+                            ensure!(!preview.cancelled(), "face enrollment was cancelled");
+                            ensure!(status.success(), "face enrollment failed ({status})");
+                            return Ok(std::process::Output {
+                                status, stdout: protocol.finish()?, stderr: Vec::new(),
+                            });
+                        }
+                    }
+                    if !received { std::thread::sleep(Duration::from_millis(10)); }
+                }
+            })();
+            // EOF gives the recorder its normal cancellation/rollback path.
+            // Continue draining so a writer cannot block rollback on a full pipe.
+            preview.close_stdin();
+            drop(child.stdin.take());
+            if result.is_err() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().ok().flatten() {
+                        exit_status = Some(status);
+                        break;
+                    }
+                    if !nonblocking || Instant::now() >= deadline {
+                        // Let sudo forward termination to its supervised child;
+                        // SIGKILLing only sudo can strand a privileged recorder.
+                        let killed = if unsafe { libc::kill(i32::try_from(child.id())?, libc::SIGTERM) } == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        };
+                        let waited = child.wait();
+                        exit_status = Some(waited.context("cannot reap failed face enrollment")?);
+                        if let Err(error) = killed {
+                            if error.kind() != std::io::ErrorKind::InvalidInput {
+                                return Err(error).context("cannot stop failed face enrollment");
+                            }
+                        }
+                        break;
+                    }
+                    if let Some(stdout) = stdout.as_mut() {
+                        let mut discard = [0_u8; 8192];
+                        let _ = stdout.read(&mut discard);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let cancelled = preview.finish(if result.is_ok() { "complete" } else { "failed" });
+            if cancelled && result.is_ok() {
+                result = Err(anyhow::anyhow!("face enrollment was cancelled"));
+            }
+            // Root may have completed its transaction before a malformed
+            // protocol line or a final Cancel was noticed by the display.
+            if result.is_err() && exit_status.is_some_and(|status| status.success()) {
+                self.invoke("rollback", user)
+                    .context("face enrollment failed and completed enrollment rollback failed")?;
+            }
+            result
+        }
+
         fn invoke(
             &self,
             action: &str,
@@ -1022,6 +1147,32 @@ mod linux {
         args: &[&std::ffi::OsStr],
         input: Option<&File>,
     ) -> anyhow::Result<std::process::Output> {
+        let mut command = privileged_command(tool, args)?;
+        // Use an already-open unprivileged descriptor. A source pathname could
+        // otherwise be swapped for a root-only file before sudo opens it.
+        let stdin = match input {
+            Some(file) => {
+                let mut input = file.try_clone()?;
+                input.rewind()?;
+                Stdio::from(input)
+            }
+            None => Stdio::inherit(),
+        };
+        let output = command
+            .stdin(stdin)
+            .stderr(Stdio::inherit())
+            .output()
+            .with_context(|| {
+                format!("cannot execute controlled installation tool {tool}")
+            })?;
+        ensure!(output.status.success(), "{tool} failed ({})", output.status);
+        Ok(output)
+    }
+
+    fn privileged_command(
+        tool: &str,
+        args: &[&std::ffi::OsStr],
+    ) -> anyhow::Result<Command> {
         for directory in SYSTEM_PATH.split(':') {
             trusted_directory(Path::new(directory))?;
         }
@@ -1034,28 +1185,8 @@ mod linux {
             command.arg("--").arg(tool);
             command
         };
-        // Use an already-open unprivileged descriptor. A source pathname could
-        // otherwise be swapped for a root-only file before sudo opens it.
-        let stdin = match input {
-            Some(file) => {
-                let mut input = file.try_clone()?;
-                input.rewind()?;
-                Stdio::from(input)
-            }
-            None => Stdio::inherit(),
-        };
-        let output = command
-            .args(args)
-            .env_clear()
-            .env("PATH", SYSTEM_PATH)
-            .stdin(stdin)
-            .stderr(Stdio::inherit())
-            .output()
-            .with_context(|| {
-                format!("cannot execute controlled installation tool {tool}")
-            })?;
-        ensure!(output.status.success(), "{tool} failed ({})", output.status);
-        Ok(output)
+        command.args(args).env_clear().env("PATH", SYSTEM_PATH);
+        Ok(command)
     }
 
     fn install_policy(

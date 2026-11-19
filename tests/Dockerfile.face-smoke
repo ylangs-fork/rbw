@@ -14,6 +14,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --locked --release --bins --no-default-features \
+    && CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="/usr/sbin/runuser -u nobody --" \
+       cargo test --locked --release --no-default-features --bin rbw enrollment_preview \
     && install -d /out/home /tmp/face-fixture-runtime \
     && install target/release/rbw target/release/rbw-agent /out/ \
     && ssh-keygen -q -t ed25519 -N '' -C face-smoke -f /tmp/face-fixture-key \
