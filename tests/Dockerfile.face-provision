@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7-labs
+# Release builder only: dependency resolution and compilation never run at login.
+# docker buildx build --platform linux/amd64 -f tests/Dockerfile.face-provision \
+#   --target artifact --output type=local,dest=dist/face-runtime .
+FROM ubuntu:22.04@sha256:9abcaffc92a5279fff3a6a41635c0800ea33e528425fb389658806476e7defde AS bundle-builder
+ARG RBW_VERSION=1.17.0
+ENV SOURCE_DATE_EPOCH=1735689600 \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CFLAGS="-O2 -ffile-prefix-map=/build=. -fdebug-prefix-map=/build=." \
+    CXXFLAGS="-O2 -ffile-prefix-map=/build=. -fdebug-prefix-map=/build=." \
+    LC_ALL=C.UTF-8
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && printf '%s\n' \
+      'deb http://archive.ubuntu.com/ubuntu jammy main universe' \
+      'deb http://archive.ubuntu.com/ubuntu jammy-updates main universe' \
+      'deb http://security.ubuntu.com/ubuntu jammy-security main universe' \
+      >/etc/apt/sources.list
+# Bootstrap CA certificates with apt's signed repository verification, then HTTPS.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+    && printf '%s\n' \
+      'deb https://archive.ubuntu.com/ubuntu jammy main universe' \
+      'deb https://archive.ubuntu.com/ubuntu jammy-updates main universe' \
+      'deb https://security.ubuntu.com/ubuntu jammy-security main universe' \
+      >/etc/apt/sources.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential meson ninja-build pkg-config gettext cmake patchelf binutils \
+      libpam0g-dev libinih-dev libevdev-dev python3 python3-dev python3-setuptools \
+      python3-packaging libopenblas-dev liblapack-dev python3-opencv python3-numpy \
+      v4l-utils libnotify-bin
+COPY tools/face-runtime/ /opt/face-runtime/
+RUN --mount=type=cache,target=/root/.cache/face-runtime,sharing=locked \
+    python3 -I /opt/face-runtime/build.py --version "$RBW_VERSION"
+
+# An image for inspection/export is also available with:
+# docker build -f tests/Dockerfile.face-provision --target bundle-builder -t rbw-face-builder .
+# docker create --name rbw-face-export rbw-face-builder /bin/true
+# docker cp rbw-face-export:/out/. out/
+FROM scratch AS artifact
+COPY --from=bundle-builder /out/ /

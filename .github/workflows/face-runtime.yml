@@ -1,0 +1,57 @@
+name: face-runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: face-runtime
+  cancel-in-progress: false
+
+jobs:
+  build-verify-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: face-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build complete precompiled runtime
+        run: |
+          docker buildx build --platform linux/amd64 --progress=plain \
+            -f tests/Dockerfile.face-provision --target artifact \
+            --output type=local,dest=out .
+          (cd out && sha256sum --check ./*.tar.gz.sha256)
+      - name: Verify clean offline Ubuntu targets
+        run: |
+          for version in 22.04 24.04; do
+            docker run --rm --network none \
+              --mount "type=bind,src=$PWD/out,dst=/input,readonly" \
+              --mount "type=bind,src=$PWD/tests/face_runtime_probe.py,dst=/probe.py,readonly" \
+              "ubuntu:$version" /bin/sh -euxc '
+                mkdir -p /usr/lib/security
+                tar --extract --gzip --file /input/rbw-face-runtime-1.17.0-linux-x86_64-ubuntu22.04.tar.gz \
+                  --directory /usr/lib/security --no-same-owner --no-same-permissions
+                /usr/lib/security/rbw-howdy/runtime/bin/python3 -I /probe.py
+                /usr/lib/security/rbw-howdy/runtime/bin/v4l2-ctl --version
+                /usr/lib/security/rbw-howdy/runtime/bin/notify-send --version
+              '
+          done
+      - name: Attest runtime provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: out/*.tar.gz
+      - name: Publish immutable runtime
+        run: |
+          gh release create "$RELEASE_TAG" out/*.tar.gz out/*.sha256 out/artifact.json \
+            --target "$GITHUB_SHA" --latest=false \
+            --title "Precompiled face runtime ($RELEASE_TAG)" \
+            --notes "Built from source commit $GITHUB_SHA in https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Includes the private Python, Howdy, dlib, OpenCV, models and native library closure. Verified on clean offline Ubuntu 22.04 and 24.04; no camera or biometric assurance. This release is consumed only after its exact digest is pinned by rbw and the Homebrew formula."
