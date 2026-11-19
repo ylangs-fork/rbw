@@ -170,7 +170,6 @@ def build(version):
         "-DUSE_AVX_INSTRUCTIONS=OFF", "-DUSE_SSE4_INSTRUCTIONS=OFF",
         "-DUSE_SSE2_INSTRUCTIONS=ON")
     run("/usr/bin/cmake", "--build", WORK / "dlib-build", "--parallel", "2")
-    copy(dlib / "tools/python/dlib", site / "dlib")
     copy("/usr/bin/python3.10", RUNTIME / "bin/python3.real")
     for name in ("notify-send", "v4l2-ctl"):
         copy("/usr/bin/" + name, RUNTIME / ("bin/" + name + ".real"))
