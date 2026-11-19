@@ -192,6 +192,11 @@ frames used for enrollment, not a second camera stream. Use Cancel to abort;
 frames are kept only in memory, never saved or sent to an external service.
 Closing the enrollment process stops the local preview. A terminal without a
 desktop display reports that a preview is unavailable.
+The page remains open for the separate real face-verification step. During
+verification it replaces the recording image with an instruction to look into
+the camera; it does not present the old recording frame as a live feed.
+Activation succeeds only after PAM accepts the face. A verification timeout or
+failure is shown explicitly, and the final text remains after the preview ends.
 
 Enrollment is offered only with interactive input/output; pipelines never prompt.
 Use `rbw setup --apply` to opt in later or repair enrollment. `rbw setup` and

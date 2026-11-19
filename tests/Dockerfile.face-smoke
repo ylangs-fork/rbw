@@ -14,6 +14,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --locked --release --bins --no-default-features \
+    && cargo test --locked --release --no-default-features --lib pam_gate \
     && CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="/usr/sbin/runuser -u nobody --" \
        cargo test --locked --release --no-default-features --bin rbw enrollment_preview \
     && install -d /out/home /tmp/face-fixture-runtime \

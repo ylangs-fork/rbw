@@ -205,14 +205,25 @@ mod linux {
         let mut changed_policy = None;
         let mut temporary_preference = false;
         let mut preference_written = false;
+        // The ordinary-user preview belongs to the whole transaction, not just
+        // the privileged recording subprocess.
+        let mut preview = None;
+        let mut failure_reason = None;
+        let outcome = (|| -> anyhow::Result<()> {
         let result = (|| -> anyhow::Result<()> {
+            if installer.is_some() {
+                // A real page must connect before Howdy's short recording window.
+                preview = Some(super::enrollment_preview::start(true)?);
+            }
             let camera = if let Some(camera) = configured {
                 camera
             } else {
                 let installer =
                     installer.as_ref().context("installer not staged")?;
-                let output = installer.prepare(&user)?;
+                let preview = preview.as_ref().context("enrollment preview not started")?;
+                let output = installer.prepare(&user, preview)?;
                 prepared = true;
+                preview.verifying();
                 let device = std::str::from_utf8(&output.stdout)?.trim();
                 ensure!(
                     device.starts_with("/dev/") && !device.contains('\n'),
@@ -263,8 +274,25 @@ mod linux {
                 "rbw face setup",
                 "Verify face authorization before enabling it",
             )?;
-            runtime.block_on(gate.authorize())
-                .context("real face verification failed or was cancelled; face authorization was not enabled")?;
+            let authorization = runtime.block_on(async {
+                if let Some(preview) = preview.as_ref() {
+                    tokio::select! {
+                        biased;
+                        _ = preview.wait_cancelled() => Err(anyhow::anyhow!("Face verification was cancelled.")),
+                        result = gate.authorize() => result,
+                    }
+                } else {
+                    gate.authorize().await
+                }
+            });
+            if let Err(error) = authorization {
+                // PamGate exposes only static, allowlisted diagnostics. Never
+                // render installer output, raw PAM messages, or error chains.
+                failure_reason = Some(error.to_string());
+                return Err(error).context("real face verification failed or was cancelled; face authorization was not enabled");
+            }
+            ensure!(!preview.as_ref().is_some_and(|preview| preview.cancelled()),
+                "face setup was cancelled");
 
             // Apply only after setup UI and real PAM have succeeded; the live
             // agent retains master-password-unlocked keys across this cutover.
@@ -273,6 +301,8 @@ mod linux {
             config.save()?;
             crate::commands::reload_session_config()
                 .context("could not activate the new agent mode")?;
+            ensure!(!preview.as_ref().is_some_and(|preview| preview.cancelled()),
+                "face setup was cancelled");
             Ok(())
         })();
         let transaction = if prepared {
@@ -335,6 +365,18 @@ mod linux {
         }
         eprintln!("Face authorization enabled: real PAM verification succeeded. Your current login is preserved; cold unlock still requires the master password.");
         Ok(())
+        })();
+        if let Some(preview) = preview.as_ref() {
+            if outcome.is_ok() {
+                preview.finish("complete", "Real face verification and agent activation succeeded. Return to your terminal.");
+            } else {
+                preview.finish("failed", failure_reason.as_deref().unwrap_or(
+                    "Face setup failed; face authorization was not enabled. Check your terminal.",
+                ));
+            }
+            runtime.block_on(preview.wait_final_ack());
+        }
+        outcome
     }
 
     fn login_user() -> anyhow::Result<String> {
@@ -809,15 +851,12 @@ mod linux {
             Ok(installer)
         }
 
-        fn prepare(&self, user: &str) -> anyhow::Result<std::process::Output> {
+        fn prepare(&self, user: &str, preview: &super::enrollment_preview::Preview) -> anyhow::Result<std::process::Output> {
             use std::os::fd::AsRawFd as _;
             use std::time::{Duration, Instant};
 
             use super::enrollment_preview;
 
-            // A graphical browser must connect before Howdy's short recording
-            // window starts. Headless enrollment remains a terminal operation.
-            let preview = enrollment_preview::start(true)?;
             ensure!(!preview.cancelled(), "face enrollment was cancelled");
             let uid = rustix::process::geteuid().as_raw().to_string();
             let pid = std::process::id().to_string();
@@ -856,7 +895,7 @@ mod linux {
                         match stdout.read(&mut buffer) {
                             Ok(0) => eof = true,
                             Ok(count) => {
-                                protocol.feed(&buffer[..count], &preview)?;
+                                protocol.feed(&buffer[..count], preview)?;
                                 received = true;
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -917,8 +956,7 @@ mod linux {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            let cancelled = preview.finish(if result.is_ok() { "complete" } else { "failed" });
-            if cancelled && result.is_ok() {
+            if preview.cancelled() && result.is_ok() {
                 result = Err(anyhow::anyhow!("face enrollment was cancelled"));
             }
             // Root may have completed its transaction before a malformed
