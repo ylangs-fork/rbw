@@ -3,6 +3,34 @@ use sha2::Digest as _;
 pub const REMOTE_L1_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
+pub struct SessionSettings {
+    pub pam_gate_required: bool,
+    pub ordinary_session: bool,
+    pub timeout: std::time::Duration,
+}
+
+impl SessionSettings {
+    pub fn from_config(config: &rbw::config::Config) -> Self {
+        let ordinary_session = config.face_auth == Some(false);
+        let pam_gate_required = config
+            .face_auth
+            .unwrap_or_else(|| rbw::pam_gate::PamGate::detect().is_some());
+        let timeout = if ordinary_session {
+            std::time::Duration::from_secs(config.lock_timeout)
+        } else {
+            State::effective_l1_timeout(
+                std::time::Duration::from_secs(config.l1_timeout),
+                pam_gate_required,
+            )
+        };
+        Self {
+            pam_gate_required,
+            ordinary_session,
+            timeout,
+        }
+    }
+}
+
 pub struct State {
     // HOOK(shatter): state-machine must preserve this wrapped representation
     // when adding L1 metadata and should use `with_key` for all access.
@@ -14,10 +42,11 @@ pub struct State {
     pub timeout: crate::timeout::Timeout,
     pub l1_timeout: std::time::Duration,
     pub last_bio_success: Option<std::time::Instant>,
-    /// Fixed at agent startup. Once a secure local PAM policy selects the
-    /// local mode, a later policy error must fail closed instead of silently
-    /// downgrading the running session to the remote bypass mode.
+    /// Selected at startup or an explicit enrollment cutover. Later policy
+    /// errors fail closed rather than silently changing the running mode.
     pub(crate) pam_gate_required: bool,
+    /// Explicitly declined face enrollment: use normal request-driven idle locking.
+    pub(crate) ordinary_session: bool,
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
@@ -125,6 +154,27 @@ impl State {
     pub fn record_bio_success(&mut self) {
         self.last_bio_success = Some(std::time::Instant::now());
         self.timeout.set(self.l1_timeout);
+    }
+
+    pub fn record_activity(&mut self) {
+        if self.ordinary_session && self.l1_alive() {
+            self.record_bio_success();
+        }
+    }
+
+    pub fn reload_session_config(&mut self, config: &rbw::config::Config) {
+        let was_alive = self.l1_alive();
+        let settings = SessionSettings::from_config(config);
+        let next = self.clear_generation.borrow().wrapping_add(1);
+        self.clear_generation.send_replace(next);
+        self.pam_gate_required = settings.pam_gate_required;
+        self.ordinary_session = settings.ordinary_session;
+        self.l1_timeout = settings.timeout;
+        if was_alive {
+            self.record_bio_success();
+        } else {
+            self.clear();
+        }
     }
 
     /// Refresh the L1 timeout without recording a new bio heartbeat. Used by
@@ -305,6 +355,7 @@ mod tests {
             l1_timeout: std::time::Duration::from_secs(60),
             last_bio_success: Some(std::time::Instant::now()),
             pam_gate_required: true,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -348,6 +399,7 @@ mod tests {
             l1_timeout: std::time::Duration::from_secs(60),
             last_bio_success: Some(std::time::Instant::now()),
             pam_gate_required: true,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -397,6 +449,7 @@ mod tests {
                     .expect("a 61-second subtraction is representable"),
             ),
             pam_gate_required: true,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -441,6 +494,7 @@ mod tests {
             l1_timeout: std::time::Duration::from_secs(60),
             last_bio_success: Some(std::time::Instant::now()),
             pam_gate_required: false,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -472,6 +526,7 @@ mod tests {
             l1_timeout: std::time::Duration::from_secs(60),
             last_bio_success: None,
             pam_gate_required: true,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),
@@ -530,6 +585,7 @@ mod tests {
             l1_timeout: std::time::Duration::from_secs(60),
             last_bio_success: None,
             pam_gate_required: false,
+            ordinary_session: false,
             sync_timeout,
             // The push-only default.
             sync_timeout_duration: std::time::Duration::ZERO,

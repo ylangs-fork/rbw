@@ -375,6 +375,7 @@ async fn login_success(
                     })
                     .collect(),
             );
+            state.record_bio_success();
         }
         Err(e) => return Err(e).context("failed to unlock database"),
     }
@@ -1674,6 +1675,7 @@ mod device_auth_tests {
                 None
             },
             pam_gate_required: false,
+            ordinary_session: false,
             sync_timeout,
             sync_timeout_duration: std::time::Duration::ZERO,
             notifications_handler: crate::notifications::Handler::new(),

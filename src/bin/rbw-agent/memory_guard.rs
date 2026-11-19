@@ -355,6 +355,7 @@ mod tests {
                 l1_timeout: std::time::Duration::from_secs(60),
                 last_bio_success: None,
                 pam_gate_required: false,
+                ordinary_session: false,
                 sync_timeout,
                 sync_timeout_duration: std::time::Duration::ZERO,
                 notifications_handler: crate::notifications::Handler::new(),

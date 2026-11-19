@@ -16,6 +16,9 @@ use anyhow::Context as _;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use tokio::io::AsyncWriteExt as _;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod notification;
+
 const HELPER_ARGUMENT: &str = "--local-auth-helper";
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const PAM_POLICY_PATH: &str = "/etc/pam.d/rbw-device-auth";
@@ -81,6 +84,26 @@ impl PamGate {
     /// Run one fresh PAM transaction. Successful results are never cached.
     pub async fn authorize(&self) -> anyhow::Result<()> {
         authorize_inner(self).await
+    }
+}
+
+/// Send an actual setup notification through the user's desktop session.
+///
+/// This is a capability check, not a face or PAM authentication. Success means
+/// the desktop daemon accepted the notification, not that DND is disabled.
+pub async fn notification_preflight(
+    environment: &crate::protocol::Environment,
+) -> anyhow::Result<()> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        notification::preflight(environment).await
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        let _ = environment;
+        Err(anyhow::anyhow!(
+            "desktop face authorization requires GNU/Linux"
+        ))
     }
 }
 
@@ -154,9 +177,10 @@ async fn authorize_inner(gate: &PamGate) -> anyhow::Result<()> {
             anyhow::anyhow!("local system authentication is unavailable")
         })?
         .pinentry;
+    let environment = gate.environment.with_desktop_fallback();
     let input = serde_json::to_vec(&HelperInput {
         pinentry,
-        environment: gate.environment.clone(),
+        environment: environment.clone(),
         title: gate.title.clone(),
         description: gate.description.clone(),
     })
@@ -193,31 +217,53 @@ async fn authorize_inner(gate: &PamGate) -> anyhow::Result<()> {
             anyhow::anyhow!("local system authentication is unavailable")
         })?;
 
-    let result = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            anyhow::anyhow!("local system authentication is unavailable")
-        })?;
-        stdin.write_all(&input).await.map_err(|_| {
-            anyhow::anyhow!("local system authentication is unavailable")
-        })?;
-        stdin.shutdown().await.map_err(|_| {
-            anyhow::anyhow!("local system authentication is unavailable")
-        })?;
-        drop(stdin);
-        child.wait().await.map_err(|_| {
-            anyhow::anyhow!("local system authentication is unavailable")
+    let pam = async {
+        let result = tokio::time::timeout(AUTH_TIMEOUT, async {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                anyhow::anyhow!("local system authentication is unavailable")
+            })?;
+            stdin.write_all(&input).await.map_err(|_| {
+                anyhow::anyhow!("local system authentication is unavailable")
+            })?;
+            stdin.shutdown().await.map_err(|_| {
+                anyhow::anyhow!("local system authentication is unavailable")
+            })?;
+            drop(stdin);
+            child.wait().await.map_err(|_| {
+                anyhow::anyhow!("local system authentication is unavailable")
+            })
         })
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!("local system authentication timed out")
-    })??;
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("local system authentication timed out")
+        })??;
 
-    // wait() reaped the helper and released its numeric PID/PGID. Disarm the
-    // guard before branching so drop cannot signal a subsequently reused PGID.
-    process_group.disarm();
-    if !result.success() {
-        return Err(anyhow::anyhow!("local system authentication failed"));
+        // Disarm immediately after reaping, even if notification delivery is
+        // still pending. Never signal a subsequently reused numeric PGID.
+        process_group.disarm();
+        if !result.success() {
+            return Err(anyhow::anyhow!(
+                "local system authentication failed"
+            ));
+        }
+        Ok(())
+    };
+
+    // Start both together. Even a quick PAM rejection must finish its notice;
+    // a failed notice cancels recognition immediately rather than authorizing
+    // an unannounced request. Dropping either path retains group cleanup.
+    let notice =
+        notification::authorize(&environment, &gate.title, &gate.description);
+    tokio::pin!(notice, pam);
+    tokio::select! {
+        result = &mut notice => {
+            result?;
+            pam.await?;
+        }
+        result = &mut pam => {
+            notice.await?;
+            result?;
+        }
     }
     Ok(())
 }

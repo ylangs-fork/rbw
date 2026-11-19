@@ -1389,7 +1389,7 @@ pub fn login() -> anyhow::Result<()> {
     ensure_agent()?;
     crate::actions::login()?;
 
-    Ok(())
+    crate::setup::after_login()
 }
 
 pub fn unlock() -> anyhow::Result<()> {
@@ -2297,6 +2297,11 @@ pub fn stop_agent() -> anyhow::Result<()> {
     crate::actions::quit()?;
 
     Ok(())
+}
+
+pub(crate) fn reload_session_config() -> anyhow::Result<()> {
+    ensure_agent()?;
+    crate::actions::reload_session_config()
 }
 
 fn ensure_agent() -> anyhow::Result<()> {

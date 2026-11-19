@@ -26,6 +26,10 @@ pub fn login() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Login)
 }
 
+pub fn reload_session_config() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ReloadSessionConfig)
+}
+
 pub fn unlock() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Unlock)
 }

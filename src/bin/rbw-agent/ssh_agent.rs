@@ -32,22 +32,51 @@ impl SshAgent {
         let fingerprint = public_key
             .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
             .to_string();
-        let policy = self.config.policy_for(&fingerprint);
-        let (l1_alive, mut cancellation) = {
+        let (
+            l1_alive,
+            mut cancellation,
+            face_required,
+            ordinary,
+            environment,
+        ) = {
             let state = self.state.lock().await;
-            (state.l1_alive(), state.cancellation())
+            (
+                state.l1_alive(),
+                state.cancellation(),
+                state.pam_gate_required(),
+                state.ordinary_session,
+                state.last_environment().clone(),
+            )
         };
-        let gate = rbw::pam_gate::PamGate::detect();
+        let policy = match self.config.policy_for(&fingerprint) {
+            rbw::config::SshAgentPolicy::L1 if face_required => {
+                rbw::config::SshAgentPolicy::Always
+            }
+            policy => policy,
+        };
+        let gate = if ordinary {
+            None
+        } else {
+            rbw::pam_gate::PamGate::detect()
+        };
 
         match policy_decision(policy, l1_alive, gate.is_some()) {
-            GateDecision::Allow => Ok(()),
+            GateDecision::Allow => {
+                self.state.lock().await.record_activity();
+                Ok(())
+            }
             GateDecision::Authorize => {
                 // Face authorization cannot establish or revive a cold session.
                 if !l1_alive {
                     return Err(anyhow::anyhow!("agent is locked"));
                 }
                 let gate = gate
-                    .ok_or_else(|| anyhow::anyhow!("PAM gate unavailable"))?;
+                    .ok_or_else(|| anyhow::anyhow!("PAM gate unavailable"))?
+                    .with_context(
+                        environment,
+                        "Authorize rbw SSH signing",
+                        "Look at the camera to authorize an SSH signature",
+                    )?;
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => {

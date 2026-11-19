@@ -70,6 +70,8 @@ pub const ENVIRONMENT_VARIABLES: &[&str] = &[
     "WAYLAND_DISPLAY",
     // Used by Qt and other non-GTK toolkits to check for X11 or Wayland
     "XDG_SESSION_TYPE",
+    // User-session sockets used by Wayland and desktop notifications.
+    "XDG_RUNTIME_DIR",
     // Used by Qt to explicitly request X11 or Wayland; in particular, needed to
     // make Qt use Wayland on GNOME
     "QT_QPA_PLATFORM",
@@ -175,6 +177,32 @@ impl Environment {
             .filter(|(var, _)| (*ENVIRONMENT_VARIABLES_OS).contains(var))
             .collect()
     }
+
+    /// SSH-agent requests have no client desktop environment. Fill only
+    /// missing desktop fields from the agent's own login session, never PATH
+    /// or arbitrary process variables.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn with_desktop_fallback(&self) -> Self {
+        let mut env_vars = self.env_vars();
+        for name in [
+            "DISPLAY",
+            "XAUTHORITY",
+            "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            if !env_vars.contains_key(std::ffi::OsStr::new(name)) {
+                if let Some(value) = std::env::var_os(name) {
+                    env_vars.insert(name.into(), value);
+                }
+            }
+        }
+        Self::new(
+            self.tty().map(std::ffi::OsStr::to_os_string),
+            env_vars.into_iter().collect(),
+        )
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -182,6 +210,7 @@ impl Environment {
 pub enum Action {
     Login,
     Register,
+    ReloadSessionConfig,
     Unlock,
     UnlockWithUserKey {
         key: UserKeyMaterial,
@@ -369,5 +398,62 @@ mod tests {
             serde_json::to_value(Action::UnlockWithDevice).unwrap(),
             serde_json::json!({"type": "UnlockWithDevice"}),
         );
+    }
+
+    #[test]
+    fn desktop_session_fields_are_allowed_but_secrets_and_path_are_not() {
+        let environment = Environment::new(
+            None,
+            vec![
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    "unix:path=/user/bus".into(),
+                ),
+                ("XDG_RUNTIME_DIR".into(), "/user".into()),
+                ("PATH".into(), "/untrusted".into()),
+                ("HINDSIGHT_API_TOKEN".into(), "secret".into()),
+                ("LD_PRELOAD".into(), "/untrusted.so".into()),
+            ],
+        );
+        let variables = environment.env_vars();
+        assert_eq!(variables.len(), 2);
+        assert_eq!(
+            variables.get(std::ffi::OsStr::new("XDG_RUNTIME_DIR")),
+            Some(&std::ffi::OsString::from("/user")),
+        );
+        assert!(variables
+            .contains_key(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS")));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn explicit_client_desktop_fields_survive_agent_fallback() {
+        let variables = [
+            "DISPLAY",
+            "XAUTHORITY",
+            "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ];
+        let environment = Environment::new(
+            Some("/dev/tty-test".into()),
+            variables
+                .iter()
+                .map(|name| ((*name).into(), "client".into()))
+                .collect(),
+        )
+        .with_desktop_fallback();
+        assert_eq!(
+            environment.tty(),
+            Some(std::ffi::OsStr::new("/dev/tty-test"))
+        );
+        let actual = environment.env_vars();
+        for name in variables {
+            assert_eq!(
+                actual.get(std::ffi::OsStr::new(name)),
+                Some(&std::ffi::OsString::from("client")),
+            );
+        }
     }
 }
