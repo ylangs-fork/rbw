@@ -10,6 +10,11 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::process::Stdio;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 
 #[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
 use anyhow::Context as _;
@@ -30,6 +35,44 @@ const DEFAULT_DESCRIPTION: &str = "Authorize access to rbw secrets";
 const MAX_HELPER_INPUT: usize = 64 * 1024;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum HelperFailure {
+    Generic = 1,
+    Timeout = 10,
+    TooDark = 11,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HelperFailure {
+    fn classify(message: &CStr) -> Option<Self> {
+        match message.to_bytes() {
+            b"Failure, timeout reached" => Some(Self::Timeout),
+            b"Face detection image too dark" => Some(Self::TooDark),
+            _ => None,
+        }
+    }
+
+    fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(10) => Self::Timeout,
+            Some(11) => Self::TooDark,
+            _ => Self::Generic,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Generic => "local system authentication failed",
+            Self::Timeout => {
+                "face verification timed out without an accepted match"
+            }
+            Self::TooDark => "face image too dark",
+        }
+    }
+}
 
 #[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -120,15 +163,16 @@ fn helper_requested_from(
         && args.next().is_none()
 }
 
-/// Run the isolated PAM transaction. The caller deliberately exposes only the
-/// process exit status; helper errors and PAM messages never cross into agent
-/// logs or the public IPC protocol.
-pub fn run_helper() -> bool {
-    run_helper_inner().is_ok()
+/// Run the isolated PAM transaction and return its process exit code.
+///
+/// Only allowlisted, static failure reasons cross this boundary; raw PAM
+/// messages and helper errors never enter agent logs or the public protocol.
+pub fn run_helper() -> i32 {
+    run_helper_inner().unwrap_or(1)
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn run_helper_inner() -> anyhow::Result<()> {
+fn run_helper_inner() -> anyhow::Result<i32> {
     disable_tracing().context("failed to protect PAM helper memory")?;
     validate_policy()?;
     let input = read_helper_input()?;
@@ -138,6 +182,7 @@ fn run_helper_inner() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("failed to initialize local-auth prompt runtime")?;
+    let failure_reason = Arc::new(AtomicU8::new(HelperFailure::Generic as u8));
     let conversation = Conversation {
         username: CString::new(username.as_bytes())
             .context("effective username contains a NUL byte")?,
@@ -146,21 +191,25 @@ fn run_helper_inner() -> anyhow::Result<()> {
         description: input.description,
         title: input.title,
         runtime,
+        failure_reason: Arc::clone(&failure_reason),
     };
     let mut context =
         pam_client2::Context::new(PAM_SERVICE, Some(&username), conversation)
             .context("failed to initialize PAM")?;
-    context
-        .authenticate(pam_client2::Flag::NONE)
-        .context("PAM authentication failed")?;
+    if context.authenticate(pam_client2::Flag::NONE).is_err() {
+        let reason = HelperFailure::from_code(Some(i32::from(
+            failure_reason.load(Ordering::Relaxed),
+        )));
+        return Ok(reason as i32);
+    }
     context
         .acct_mgmt(pam_client2::Flag::NONE)
         .context("PAM account authorization failed")?;
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn run_helper_inner() -> anyhow::Result<()> {
+fn run_helper_inner() -> anyhow::Result<i32> {
     Err(anyhow::anyhow!(
         "local system authentication requires GNU/Linux"
     ))
@@ -243,7 +292,7 @@ async fn authorize_inner(gate: &PamGate) -> anyhow::Result<()> {
         process_group.disarm();
         if !result.success() {
             return Err(anyhow::anyhow!(
-                "local system authentication failed"
+                HelperFailure::from_code(result.code()).message()
             ));
         }
         Ok(())
@@ -443,6 +492,7 @@ struct Conversation {
     title: String,
     description: String,
     runtime: tokio::runtime::Runtime,
+    failure_reason: Arc<AtomicU8>,
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -475,7 +525,11 @@ impl pam_client2::ConversationHandler for Conversation {
 
     fn text_info(&mut self, _message: &CStr) {}
 
-    fn error_msg(&mut self, _message: &CStr) {}
+    fn error_msg(&mut self, message: &CStr) {
+        if let Some(reason) = HelperFailure::classify(message) {
+            self.failure_reason.store(reason as u8, Ordering::Relaxed);
+        }
+    }
 
     fn radio_prompt(
         &mut self,
@@ -572,10 +626,59 @@ mod tests {
             runtime: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap(),
+            failure_reason: Arc::new(AtomicU8::new(HelperFailure::Generic as u8)),
         };
         let response = conversation.prompt_echo_on(c"forged prompt").unwrap();
         assert_eq!(response.as_bytes(), b"expected-user");
         assert!(conversation.radio_prompt(c"yes?").is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn pam_error_messages_classify_only_exact_allowlisted_reasons() {
+        let mut conversation = Conversation {
+            username: CString::new("expected-user").unwrap(),
+            pinentry: "unused".to_string(),
+            environment: crate::protocol::Environment::default(),
+            title: DEFAULT_TITLE.to_string(),
+            description: DEFAULT_DESCRIPTION.to_string(),
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+            failure_reason: Arc::new(AtomicU8::new(HelperFailure::Generic as u8)),
+        };
+        for message in [
+            c"untrusted private diagnostic",
+            c"Failure, timeout reached\n",
+            c"prefix Face detection image too dark",
+            c"NO_FACE_MODEL",
+            c"INVALID_DEVICE",
+        ] {
+            conversation.error_msg(message);
+            assert_eq!(
+                conversation.failure_reason.load(Ordering::Relaxed),
+                HelperFailure::Generic as u8,
+            );
+        }
+        conversation.error_msg(c"Failure, timeout reached");
+        assert_eq!(
+            conversation.failure_reason.load(Ordering::Relaxed),
+            HelperFailure::Timeout as u8,
+        );
+        conversation.error_msg(c"Face detection image too dark");
+        assert_eq!(
+            conversation.failure_reason.load(Ordering::Relaxed),
+            HelperFailure::TooDark as u8,
+        );
+        assert_eq!(HelperFailure::from_code(Some(10)), HelperFailure::Timeout);
+        assert_eq!(HelperFailure::from_code(Some(11)), HelperFailure::TooDark);
+        for code in [None, Some(1), Some(12), Some(255)] {
+            assert_eq!(HelperFailure::from_code(code), HelperFailure::Generic);
+            assert_eq!(
+                HelperFailure::from_code(code).message(),
+                "local system authentication failed",
+            );
+        }
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

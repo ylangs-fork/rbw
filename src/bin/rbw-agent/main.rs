@@ -135,7 +135,7 @@ fn main() {
         std::process::exit(i32::from(!crate::memory_guard::run_sentinel()));
     }
     if crate::local_auth::helper_requested() {
-        std::process::exit(i32::from(!crate::local_auth::run_helper()));
+        std::process::exit(crate::local_auth::run_helper());
     }
 
     let res = real_main();

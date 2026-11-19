@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.17.3] - 2026-11-19
+
+### Fixed
+
+* Keep the enrollment page open through the separate real PAM verification
+  and activation, rather than ending it immediately after model creation.
+  Clear the recording image during verification and show the final outcome.
+* Report recognized face-verification timeout and too-dark failures without
+  exposing arbitrary PAM messages. Recording a model alone never enables face
+  authorization; matching thresholds and fail-closed behavior are unchanged.
+
 ## [1.17.2] - 2026-11-19
 
 ### Added

@@ -24,11 +24,20 @@ const meter = document.querySelector('#meter');
 const cancel = document.querySelector('#cancel');
 const placeholder = document.querySelector('.view p');
 let ended = false;
-function finish(message) {
-  ended = true; image.removeAttribute('src'); image.hidden = true;
-  status.textContent = message; detail.textContent = 'Return to your terminal to continue.';
-  placeholder.textContent = 'Camera closed';
-  meter.textContent = '—'; cancel.disabled = true;
+function clearCamera(message) {
+  image.removeAttribute('src'); image.hidden = true;
+  placeholder.textContent = message;
+  status.dataset.warning = 'false'; meter.textContent = '—';
+}
+async function finish(frame) {
+  ended = true; clearCamera('Camera closed');
+  status.textContent = frame.status === 'complete' ? 'Face authorization enabled' :
+    frame.status === 'cancelled' ? 'Face setup cancelled' : 'Face setup failed';
+  detail.textContent = frame.reason;
+  cancel.disabled = true;
+  // Acknowledge only after applying the final result, never a live frame.
+  await new Promise(resolve => window.requestAnimationFrame(resolve));
+  try { await fetch('ack', {method: 'POST', credentials: 'omit', cache: 'no-store'}); } catch (_) {}
 }
 async function poll() {
   try {
@@ -36,10 +45,19 @@ async function poll() {
     if (!response.ok) throw new Error('disconnected');
     const frame = await response.json();
     if (ended) return;
-    if (frame.status !== 'active' && frame.status !== 'waiting') {
-      finish(frame.status === 'cancelled' ? 'Enrollment cancelled' : 'Preview finished'); return;
+    if (['complete', 'failed', 'cancelled'].includes(frame.status)) {
+      await finish(frame); return;
     }
-    if (frame.jpeg) {
+    if (frame.status === 'verifying') {
+      clearCamera('PAM is using its own camera; live preview is stopped.');
+      status.textContent = 'Verifying face';
+      detail.textContent = 'Look directly at the IR camera. Keep this page open while real face verification and activation finish.';
+    } else if (frame.status === 'cancelling') {
+      clearCamera('Camera closing');
+      status.textContent = 'Cancelling face setup';
+      detail.textContent = 'Waiting for enrollment or verification to stop and changes to be rolled back.';
+      cancel.disabled = true;
+    } else if (frame.jpeg) {
       image.src = 'data:image/jpeg;base64,' + frame.jpeg; image.hidden = false;
       const dark = frame.darkness > frame.threshold;
       status.textContent = dark ? 'Too dark' : 'Camera active';
@@ -47,16 +65,26 @@ async function poll() {
       detail.textContent = dark ? 'Face the IR camera and move closer. Enrollment is waiting for a usable frame.' : 'Keep your face centered and look into the IR camera.';
       meter.textContent = frame.darkness.toFixed(1) + '% dark · limit ' + frame.threshold.toFixed(1) + '%';
     }
-  } catch (_) { finish('Preview disconnected'); return; }
+  } catch (_) {
+    if (!ended) {
+      ended = true; clearCamera('Camera closed');
+      status.textContent = 'Preview disconnected';
+      detail.textContent = 'Check your terminal for the actual face setup result.';
+      cancel.disabled = true;
+    }
+    return;
+  }
   if (!ended) window.setTimeout(poll, 100);
 }
 cancel.addEventListener('click', async () => {
   cancel.disabled = true;
+  clearCamera('Camera closing');
   try {
     const response = await fetch('cancel', {method: 'POST', credentials: 'omit', cache: 'no-store'});
     if (!response.ok) throw new Error('cancel failed');
-    finish('Enrollment cancelled');
-  } catch (_) { finish('Preview disconnected'); }
+  } catch (_) {
+    detail.textContent = 'Cancellation could not be confirmed. Check your terminal.';
+  }
 });
 window.addEventListener('pagehide', () => { image.removeAttribute('src'); });
 poll();
@@ -90,6 +118,9 @@ struct Content {
     cancelled: bool,
     finished: bool,
     page_ready: bool,
+    verifying: bool,
+    final_seen: bool,
+    final_acknowledged: bool,
 }
 
 struct Shared {
@@ -97,6 +128,8 @@ struct Shared {
     authority: String,
     origin: String,
     content: Mutex<Content>,
+    cancellation: tokio::sync::Notify,
+    acknowledgement: tokio::sync::Notify,
 }
 
 pub(super) struct Preview {
@@ -128,7 +161,12 @@ pub(super) fn start(open_browser: bool) -> anyhow::Result<Preview> {
             cancelled: false,
             finished: false,
             page_ready: false,
+            verifying: false,
+            final_seen: false,
+            final_acknowledged: false,
         }),
+        cancellation: tokio::sync::Notify::new(),
+        acknowledgement: tokio::sync::Notify::new(),
     });
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -192,6 +230,25 @@ impl Preview {
         self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cancelled
     }
 
+    pub(super) async fn wait_cancelled(&self) {
+        loop {
+            let notified = self.shared.cancellation.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled() { return; }
+            notified.await;
+        }
+    }
+
+    pub(super) fn verifying(&self) {
+        let mut content = self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !content.cancelled && !content.finished {
+            content.verifying = true;
+            content.snapshot = Bytes::from_static(b"{\"status\":\"verifying\"}");
+            drop(content.stdin.take());
+        }
+    }
+
     pub(super) fn close_stdin(&self) {
         drop(self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stdin.take());
     }
@@ -211,26 +268,48 @@ impl Preview {
         struct Snapshot<'a> { status: &'static str, #[serde(flatten)] frame: &'a Frame }
         let snapshot = Bytes::from(serde_json::to_vec(&Snapshot { status: "active", frame: &frame })?);
         let mut content = self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !content.cancelled && !content.finished { content.snapshot = snapshot; }
+        if !content.cancelled && !content.finished && !content.verifying { content.snapshot = snapshot; }
         Ok(())
     }
 
-    pub(super) fn finish(&self, status: &str) -> bool {
+    pub(super) fn finish(&self, status: &str, reason: &str) {
         let mut content = self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        content.snapshot = Bytes::from_static(match if content.cancelled { "cancelled" } else { status } {
-            "complete" => b"{\"status\":\"complete\"}",
-            "cancelled" => b"{\"status\":\"cancelled\"}",
-            _ => b"{\"status\":\"failed\"}",
-        });
+        if content.finished { return; }
+        let status = match status {
+            "complete" => "complete",
+            _ if content.cancelled => "cancelled",
+            _ => "failed",
+        };
+        let reason = if status == "cancelled" { "Face setup was cancelled; face authorization was not enabled." } else { reason };
+        #[derive(serde::Serialize)]
+        struct Final<'a> { status: &'static str, reason: &'a str }
+        content.snapshot = Bytes::from(serde_json::to_vec(&Final { status, reason })
+            .expect("serializing final preview text"));
         content.finished = true;
         drop(content.stdin.take());
-        content.cancelled
+    }
+
+    /// Wait only for a connected page, and never keep a headless setup alive.
+    pub(super) async fn wait_final_ack(&self) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.shared.acknowledgement.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let content = self.shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !content.page_ready || content.final_acknowledged { return content.final_acknowledged; }
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait).await.unwrap_or(false)
     }
 }
 
 impl Drop for Preview {
     fn drop(&mut self) {
-        self.finish("failed");
+        self.finish("failed", "Face setup stopped before activation. Check your terminal.");
         if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
         if let Some(server) = self.server.take() { let _ = server.join(); }
     }
@@ -253,6 +332,7 @@ async fn handle(State(shared): State<Arc<Shared>>, method: Method, uri: Uri, hea
             let snapshot = {
                 let mut content = shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 content.page_ready = true;
+                if content.finished { content.final_seen = true; }
                 content.snapshot.clone()
             };
             response(StatusCode::OK, "application/json", snapshot)
@@ -261,9 +341,19 @@ async fn handle(State(shared): State<Arc<Shared>>, method: Method, uri: Uri, hea
             let mut content = shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !content.finished {
                 content.cancelled = true;
-                content.snapshot = Bytes::from_static(b"{\"status\":\"cancelled\"}");
+                content.snapshot = Bytes::from_static(b"{\"status\":\"cancelling\"}");
                 drop(content.stdin.take());
+                shared.cancellation.notify_waiters();
             }
+            response(StatusCode::NO_CONTENT, "text/plain", Bytes::new())
+        }
+        (Method::POST, "ack") if origin == Some(shared.origin.as_str()) => {
+            let mut content = shared.content.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !content.finished || !content.final_seen {
+                return response(StatusCode::CONFLICT, "text/plain", Bytes::new());
+            }
+            content.final_acknowledged = true;
+            shared.acknowledgement.notify_waiters();
             response(StatusCode::NO_CONTENT, "text/plain", Bytes::new())
         }
         _ => response(StatusCode::NOT_FOUND, "text/plain", Bytes::new()),
@@ -378,8 +468,136 @@ mod tests {
         }
         assert!(preview.cancelled());
         let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
+        assert_eq!(state["status"], "cancelling");
+        assert!(state.get("jpeg").is_none());
+        preview.finish("failed", "Enrollment failed.");
+        let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
         assert_eq!(state["status"], "cancelled");
         assert!(state.get("jpeg").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn verifying_erases_frames_and_keeps_server_available() -> anyhow::Result<()> {
+        let preview = start(false)?;
+        let frame = br#"{"jpeg":"/9j/2Q==","darkness":20,"threshold":60}"#;
+        preview.ingest(frame)?;
+        preview.verifying();
+        // A late recorder frame must not masquerade as the PAM camera.
+        preview.ingest(frame)?;
+        let client = reqwest::blocking::Client::builder().no_proxy().build()?;
+        let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
+        assert_eq!(state["status"], "verifying");
+        assert!(state.get("jpeg").is_none());
+        assert!(!preview.shared.content.lock().unwrap().finished);
+        let response = client.post(format!("{}cancel", preview.url()))
+            .header("Origin", &preview.shared.origin).send()?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(preview.cancelled());
+        Ok(())
+    }
+
+    #[test]
+    fn final_ack_requires_consumed_result_and_trusted_request() -> anyhow::Result<()> {
+        let preview = start(false)?;
+        let client = reqwest::blocking::Client::builder().no_proxy().build()?;
+        let ack = format!("{}ack", preview.url());
+        client.get(format!("{}state", preview.url())).send()?.error_for_status()?;
+        assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin).send()?.status(), StatusCode::CONFLICT);
+        preview.finish("failed", "Face verification timed out.");
+        // A request before the final snapshot was fetched cannot acknowledge it.
+        assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin).send()?.status(), StatusCode::CONFLICT);
+        let state: serde_json::Value = client.get(format!("{}state", preview.url())).send()?.json()?;
+        assert_eq!(state["status"], "failed");
+        assert_eq!(state["reason"], "Face verification timed out.");
+        assert!(state.get("jpeg").is_none());
+        assert_eq!(client.post(&ack).send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(&ack).header("Origin", "https://evil.invalid").send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin)
+            .header("Host", "evil.invalid").send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin)
+            .header("sec-fetch-site", "cross-site").send()?.status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.post(format!("{}/wrong/ack", preview.shared.origin))
+            .header("Origin", &preview.shared.origin).send()?.status(), StatusCode::NOT_FOUND);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            // Merely serving the final state, or an untrusted ACK, is not enough.
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), preview.wait_final_ack()).await.is_err());
+        });
+        assert_eq!(client.post(&ack).header("Origin", &preview.shared.origin).send()?.status(), StatusCode::NO_CONTENT);
+        assert!(runtime.block_on(preview.wait_final_ack()));
+        // Neither another finalization nor Drop may replace the acknowledged result.
+        preview.finish("complete", "Incorrect replacement.");
+        let shared = Arc::clone(&preview.shared);
+        drop(preview);
+        let content = shared.content.lock().unwrap();
+        let retained: serde_json::Value = serde_json::from_slice(&content.snapshot)?;
+        assert_eq!(retained, state);
+        Ok(())
+    }
+
+    #[test]
+    fn final_ack_wakes_waiter_and_headless_completion_is_immediate() -> anyhow::Result<()> {
+        let preview = start(false)?;
+        preview.finish("complete", "Face verification and activation succeeded.");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            assert!(!tokio::time::timeout(std::time::Duration::from_millis(100), preview.wait_final_ack()).await?);
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let state: serde_json::Value = client.get(format!("{}state", preview.url())).send().await?.json().await?;
+            assert_eq!(state["status"], "complete");
+            let (acknowledged, response) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(
+                    preview.wait_final_ack(),
+                    client.post(format!("{}ack", preview.url())).header("Origin", &preview.shared.origin).send()
+                )
+            }).await?;
+            assert!(acknowledged);
+            assert_eq!(response?.status(), StatusCode::NO_CONTENT);
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_wakes_waiter_and_drops_pending_authorization() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct PendingAuthorization(Arc<AtomicBool>);
+        impl Drop for PendingAuthorization {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let preview = start(false)?;
+        preview.verifying();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = AtomicBool::new(false);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let verification = async {
+                let authorization = async {
+                    let _guard = PendingAuthorization(Arc::clone(&dropped));
+                    started.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                };
+                tokio::select! {
+                    biased;
+                    _ = preview.wait_cancelled() => {}
+                    _ = authorization => panic!("pending authorization completed"),
+                }
+            };
+            let (_, response) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(
+                    verification,
+                    client.post(format!("{}cancel", preview.url())).header("Origin", &preview.shared.origin).send()
+                )
+            }).await?;
+            assert_eq!(response?.status(), StatusCode::NO_CONTENT);
+            assert!(started.load(Ordering::SeqCst));
+            assert!(dropped.load(Ordering::SeqCst));
+            // A waiter created after the notification must also complete.
+            tokio::time::timeout(std::time::Duration::from_millis(100), preview.wait_cancelled()).await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
         Ok(())
     }
 }

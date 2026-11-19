@@ -386,7 +386,7 @@ impl Config {
 
 fn main() {
     if rbw::pam_gate::helper_requested() {
-        std::process::exit(if rbw::pam_gate::run_helper() { 0 } else { 1 });
+        std::process::exit(rbw::pam_gate::run_helper());
     }
     let opt = Opt::parse();
 

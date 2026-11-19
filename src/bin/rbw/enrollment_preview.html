@@ -4,25 +4,25 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>rbwBio · Face enrollment</title>
+  <title>rbwBio · Face setup</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
 </head>
 <body>
   <main>
-    <header><h1>Face enrollment</h1><span>rbwBio · local IR preview</span></header>
-    <section class="view" aria-label="Live infrared camera preview">
+    <header><h1>Face setup</h1><span>rbwBio · local enrollment preview</span></header>
+    <section class="view" aria-label="Face setup camera and verification status">
       <p>Waiting for your IR camera…</p>
       <img id="camera" alt="Live infrared camera frame" hidden>
     </section>
     <section class="panel" aria-live="polite">
       <h2 id="status">Waiting for camera</h2>
-      <p id="detail">Keep this preview open. Enrollment will start from your terminal.</p>
+      <p id="detail">Keep this page open through enrollment and real face verification.</p>
       <p id="meter" class="muted">Darkness — · threshold —</p>
     </section>
     <footer>
-      <span class="muted">Live frames stay in memory on this computer. Nothing is saved or uploaded.</span>
+      <span class="muted">Preview frames stay in memory on this computer and are never saved or uploaded.</span>
       <button id="cancel" type="button">Cancel</button>
     </footer>
   </main>

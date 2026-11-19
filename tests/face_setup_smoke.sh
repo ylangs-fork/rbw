@@ -277,6 +277,10 @@ cold_unlock
 set_result success
 get_secret
 [[ $(wc -l <"$control/notifications") -gt 0 ]] || fail 'secret access delivered no desktop notification'
+# A PAM_ERROR_MSG is diagnostic only: successful PAM remains authoritative.
+set_result success-timeout
+get_secret
+set_result success
 printf 'deny\n' >"$control/notification-result"
 denied_get rejected-notification
 printf 'allow\n' >"$control/notification-result"
@@ -286,18 +290,28 @@ get_secret
 renewed=$(now)
 until_time "$original" 9
 user timeout 5 rbw unlocked >"$work/renewed.out" 2>"$work/renewed.err"
-for outcome in auth_err abort; do
+for outcome in auth_err abort timeout dark unknown-message; do
     set_result "$outcome"
     before=$(event_count)
     notified=$(wc -l <"$control/notifications")
     denied_get "face-$outcome"
     [[ $(event_count) -gt $before ]] || fail "$outcome did not reach real system PAM"
     [[ $(wc -l <"$control/notifications") -gt $notified ]] || fail "$outcome authorization delivered no notification"
+    case "$outcome" in
+        timeout) expected='face verification timed out without an accepted match' ;;
+        dark) expected='face image too dark' ;;
+        *) expected='local system authentication failed' ;;
+    esac
+    grep -Fq "$expected" "$work/face-$outcome.err" || fail "$outcome lost its safe failure reason"
+    if grep -Fq -e 'Failure, timeout reached' -e 'Face detection image too dark' \
+        -e 'private-smoke-pam-diagnostic' "$work/face-$outcome.err" "$work/agent.log"; then
+        fail "$outcome exposed a raw PAM message"
+    fi
 done
 until_time "$renewed" 9
 expect_failure local-expired user timeout 5 rbw unlocked
 denied_get local-expired-get
-printf 'face smoke: master-password cold unlock, real decrypt, success-only renewal, denial/abort, expiry passed\n'
+printf 'face smoke: master-password cold unlock, real decrypt, success-only renewal, classified timeout/dark and private unknown denials, expiry passed\n'
 
 # Removing the policy during a local agent session cannot select remote mode.
 set_result success
