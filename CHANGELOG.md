@@ -61,6 +61,8 @@
 
 * Locking an agent now cancels a pending secret-access PAM authorization and
   prevents its late result from renewing a subsequently unlocked session.
+* Kept prompt validation available on non-Linux requester builds, fixing
+  compilation on macOS without enabling the unsupported local PAM backend.
 
 ## [1.15.0] - 2025-12-31
 
