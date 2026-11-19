@@ -1,11 +1,11 @@
 [package]
 name = "rbw"
-version = "1.17.0"
+version = "1.17.1"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
 edition = "2021"
 rust-version = "1.82.0"
 
-description = "Unofficial Bitwarden CLI"
+description = "rbwBio: unofficial Bitwarden CLI with opt-in face authorization"
 repository = "https://github.com/ylangs-fork/rbw"
 readme = "README.md"
 keywords = ["bitwarden"]
