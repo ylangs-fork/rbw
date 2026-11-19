@@ -182,9 +182,41 @@ printf 'synthetic model; test module supplies the decision\n' >/etc/howdy/models
 chmod 0644 /etc/howdy/config.ini /etc/howdy/models/rbw.dat
 printf 'rbw ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/face-smoke
 chmod 0440 /etc/sudoers.d/face-smoke
+cp /etc/howdy/config.ini "$work/legacy-howdy-config"
+cp /etc/howdy/models/rbw.dat "$work/legacy-howdy-model"
+printf '#%%PAM-1.0\nauth required pam_python3.so /usr/lib/security/howdy/pam.py\naccount required pam_permit.so\n' >"$work/legacy-policy"
 printf 'deny\n' >"$control/notification-result"
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ ! -e $policy ]] || fail 'failed enrollment left a newly enabled policy'
+python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
+import json, pathlib, sys
+assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
+PY
+# Exact bytes alone do not authorize migration of untrusted metadata.
+for variant in owner group mode hardlink symlink; do
+    install -o root -g root -m 0644 "$work/legacy-policy" "$policy"
+    case "$variant" in
+        owner) chown rbw:root "$policy" ;;
+        group) chown root:rbw "$policy" ;;
+        mode) chmod 0664 "$policy" ;;
+        hardlink) ln "$policy" "$work/policy-hardlink" ;;
+        symlink) rm "$policy"; ln -s "$work/legacy-policy" "$policy" ;;
+    esac
+    untrusted_stat=$(stat -c '%i:%Y:%Z:%u:%g:%a:%h:%F' "$policy")
+    expect_failure "legacy-untrusted-$variant" user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
+    cmp -s "$policy" "$work/legacy-policy" || fail "untrusted $variant legacy policy content changed"
+    [[ $(stat -c '%i:%Y:%Z:%u:%g:%a:%h:%F' "$policy") == "$untrusted_stat" ]] || fail "untrusted $variant legacy policy metadata changed"
+    rm "$policy"
+    if [[ $variant == hardlink ]]; then rm "$work/policy-hardlink"; fi
+done
+# Recognize only the exact trusted historical Python policy. Failure after the
+# native policy is published must restore those exact bytes, not delete it.
+install -o root -g root -m 0644 "$work/legacy-policy" "$policy"
+user python3 /usr/local/bin/face-smoke-onboarding yes-failed
+cmp -s "$policy" "$work/legacy-policy" || fail 'notification failure did not restore the exact legacy policy'
+[[ $(stat -c '%u:%g:%a:%h' "$policy") == 0:0:644:1 ]] || fail 'legacy-policy rollback lost trusted metadata'
+cmp -s /etc/howdy/config.ini "$work/legacy-howdy-config" || fail 'migration failure changed old Howdy configuration'
+cmp -s /etc/howdy/models/rbw.dat "$work/legacy-howdy-model" || fail 'migration failure changed old Howdy model'
 python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
 import json, pathlib, sys
 assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -218,6 +250,9 @@ assert permit.is_absolute() and permit.name == 'pam_permit.so' and permit.is_fil
 assert permit.stat().st_uid == 0 and not (permit.stat().st_mode & 0o022)
 assert all(line.startswith('#') or not line or line.split() in auth + account for line in lines)
 PY
+cmp -s /etc/howdy/config.ini "$work/legacy-howdy-config" || fail 'successful migration changed old Howdy configuration'
+cmp -s /etc/howdy/models/rbw.dat "$work/legacy-howdy-model" || fail 'successful migration changed old Howdy model'
+printf 'face smoke: exact legacy Python policy migrates with native fixture; notification failure restores old policy and preference passed\n'
 cp "$policy" "$work/managed-policy"
 policy_stat=$(stat -c '%i:%Y:%Z' "$policy")
 user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
@@ -225,7 +260,7 @@ cmp -s "$policy" "$work/managed-policy" || fail 'second apply changed policy con
 [[ $(stat -c '%i:%Y:%Z' "$policy") == "$policy_stat" ]] || fail 'idempotent apply replaced the policy'
 user rbw setup --check >"$work/check.out" 2>"$work/check.err"
 user rbw setup >"$work/default.out" 2>"$work/default.err"
-printf '# Foreign policy: must not overwrite\nauth required pam_deny.so\n' >"$policy"
+printf '#%%PAM-1.0\nauth required pam_deny.so\naccount required pam_permit.so\n' >"$policy"
 cp "$policy" "$work/foreign-policy"
 expect_failure foreign-apply user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
 expect_failure foreign-check rbw setup --check
@@ -399,8 +434,8 @@ printf 'face smoke: notification denial fails closed; explicit enable survives p
 # The shipped artifact is a test input, never a simulator or production switch.
 # No compiler/package resolver is available during real offline deployment.
 [[ -f /input/face-runtime.tar.gz ]] || fail 'mount the published precompiled face runtime at /input/face-runtime.tar.gz'
-rm "$policy" "$module"
-rm -rf /etc/howdy
+rm "$module"
+install -o root -g root -m 0644 "$work/legacy-policy" "$policy"
 package_root=$(dirname "$(dirname "$(readlink -f "$(command -v rbw)")")")
 package_archive="$package_root/libexec/face-runtime.tar.gz"
 install -d "$package_root/libexec"
@@ -415,14 +450,33 @@ config = json.loads(path.read_text())
 config.pop('face_auth', None)
 path.write_text(json.dumps(config))
 PY
+# A familiar PAM header alone is not migration permission, even when native
+# Howdy is absent. Rejection must happen before runtime deployment or enrollment.
+printf '#%%PAM-1.0\nauth required pam_deny.so\naccount required pam_permit.so\n' >"$policy"
+cp "$policy" "$work/foreign-policy"
+foreign_stat=$(stat -c '%i:%Y:%Z:%u:%g:%a:%h' "$policy")
+expect_failure foreign-missing-module user python3 /usr/local/bin/face-smoke-onboarding quiet rbw setup --apply
+cmp -s "$policy" "$work/foreign-policy" || fail 'missing native module allowed overwriting a foreign policy'
+[[ $(stat -c '%i:%Y:%Z:%u:%g:%a:%h' "$policy") == "$foreign_stat" ]] || fail 'foreign policy metadata changed'
+[[ ! -e /usr/lib/security/rbw-howdy && ! -e /etc/rbw-howdy ]] || fail 'foreign policy rejection changed runtime or enrollment'
+install -o root -g root -m 0644 "$work/legacy-policy" "$policy"
+legacy_stat=$(stat -c '%i:%Y:%Z:%u:%g:%a:%h' "$policy")
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ ! -e /usr/lib/security/rbw-howdy ]] || fail 'corrupt archive was privileged-extracted'
+cmp -s "$policy" "$work/legacy-policy" || fail 'corrupt runtime failure changed the legacy policy'
+[[ $(stat -c '%i:%Y:%Z:%u:%g:%a:%h' "$policy") == "$legacy_stat" ]] || fail 'corrupt runtime failure replaced the legacy policy'
 cp /input/face-runtime.tar.gz "$package_archive"
 chown rbw:rbw "$package_archive"
+# The ABI, not Ubuntu branding, controls deployment eligibility. The container
+# still uses its real linked glibc; this does not simulate target ABI proof.
+printf 'ID=manjaro\nNAME=Manjaro\n' >/etc/os-release
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ -f /usr/lib/security/rbw-howdy/pam_howdy.so ]] || fail 'valid precompiled runtime was not deployed'
 [[ ! -e /etc/rbw-howdy ]] || fail 'no-camera failure did not remove newly created enrollment configuration'
-[[ ! -e $policy ]] || fail 'no-camera enrollment enabled a policy'
+cmp -s "$policy" "$work/legacy-policy" || fail 'no-camera enrollment changed the exact legacy Python policy'
+[[ $(stat -c '%i:%Y:%Z:%u:%g:%a:%h' "$policy") == "$legacy_stat" ]] || fail 'no-camera failure replaced the legacy policy before enrollment readiness'
+cmp -s /etc/howdy/config.ini "$work/legacy-howdy-config" || fail 'no-camera failure changed old Howdy configuration'
+cmp -s /etc/howdy/models/rbw.dat "$work/legacy-howdy-model" || fail 'no-camera failure changed old Howdy model'
 python3 - "$HOME/.config/rbw-face-smoke/config.json" <<'PY'
 import json, pathlib, sys
 assert 'face_auth' not in json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -430,11 +484,12 @@ PY
 identity_stat=$(stat -c '%i:%Y:%Z' /usr/lib/security/rbw-howdy/.rbw-bundle-sha256)
 user python3 /usr/local/bin/face-smoke-onboarding yes-failed
 [[ $(stat -c '%i:%Y:%Z' /usr/lib/security/rbw-howdy/.rbw-bundle-sha256) == "$identity_stat" ]] || fail 'repeated deployment replaced the matching runtime'
+cmp -s "$policy" "$work/legacy-policy" || fail 'repeated failed enrollment changed the legacy policy'
 user timeout 5 rbw stop-agent
 notified=$(wc -l <"$control/notifications")
 user /usr/lib/security/rbw-howdy/runtime/bin/notify-send -- 'rbw package smoke' 'Published native notification runtime'
 [[ $(wc -l <"$control/notifications") -gt $notified ]] || fail 'bundled notification executable did not reach the real session bus'
-printf 'face smoke: published runtime deploys offline without system Python dependencies, rejects corrupt archives, and rolls back absent-camera enrollment passed\n'
+printf 'face smoke: ABI-gated runtime deploys offline with Manjaro branding, rejects corrupt archives, and preserves exact legacy policy/config/models after absent-camera enrollment passed\n'
 if pgrep -u rbw -f -- '--local-auth-helper' >/dev/null; then fail 'a local-auth helper survived teardown'; fi
 system_pam_snapshot >"$work/system-pam.after"
 cmp -s "$work/system-pam.before" "$work/system-pam.after" || fail 'setup changed another system PAM service'

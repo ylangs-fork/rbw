@@ -21,11 +21,14 @@ struct FindArgs {
 }
 
 #[derive(Debug, clap::Parser)]
-#[command(version, about = "Unofficial Bitwarden CLI")]
+#[command(
+    version,
+    about = "rbwBio: unofficial Bitwarden CLI with opt-in face authorization"
+)]
 enum Opt {
     #[command(
-        about = "Check or configure face authorization for rbw",
-        long_about = "Check rbw's isolated Linux face-authentication policy without \
+        about = "Check or configure face authorization for rbwBio",
+        long_about = "Check rbwBio's isolated Linux face-authentication policy without \
             changing files. Use --apply to enable or repair face authorization: \
             provision native Howdy and desktop notifications, configure an IR camera, \
             enroll your face and verify real authentication. May request sudo; \

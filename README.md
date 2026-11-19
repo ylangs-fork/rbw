@@ -1,7 +1,13 @@
-# rbw
+# rbwBio
 
-This is an unofficial command line client for
-[Bitwarden](https://bitwarden.com/). Although Bitwarden does come with its own
+**rbwBio** is a fork of the unofficial command line client
+[`rbw`](https://github.com/doy/rbw) for [Bitwarden](https://bitwarden.com/),
+with opt-in face authorization on GNU/Linux. The executable names remain `rbw`
+and `rbw-agent`; existing configuration, encrypted vault data, `RBW_PROFILE`
+profiles and integrations keep their existing names and locations. Neither
+the crate (`rbw`) nor the repository needs renaming.
+
+Although Bitwarden does come with its own
 [command line client](https://help.bitwarden.com/article/cli/), it is
 limited by being stateless - to use it, you're required to manually lock and
 unlock the client, and pass the temporary keys around in environment variables,
@@ -13,13 +19,14 @@ maintaining the necessary state.
 
 ## Maintenance
 
-I consider `rbw` to be essentially feature-complete for me at this point. While
-I still use it on a daily basis, and will continue to fix regressions as they
-occur, I am unlikely to spend time implementing new features on my own. If you
-would like to see new functionality in `rbw`, I am more than happy to review
-and merge pull requests implementing those features.
+The upstream `rbw` project considers its original feature set essentially
+complete. This fork maintains rbwBio's face authorization and local approval
+features while retaining the existing command and data interfaces.
 
 ## Installation
+
+Install **rbwBio** from the Homebrew tap below, or build this repository.
+The distribution packages listed here are upstream `rbw`, not rbwBio.
 
 ### Arch Linux
 
@@ -50,14 +57,21 @@ You can install it using `sudo dnf install rbw`.
 
 ### Homebrew
 
-Install this fork from its own tap, not `homebrew/core`:
+Install rbwBio from its own tap, not `homebrew/core`:
 
 ```sh
-brew install ylang-ylang/tap/rbw
+brew install ylang-ylang/tap/rbwbio
 ```
 
-Linux face authorization uses the system's Howdy installation; see
-"Face setup" below. macOS builds support requester/remote use, not Howdy.
+Existing installations of this tap's `rbw` formula migrate to `rbwbio` on
+`brew update` and `brew upgrade`. Do not install both formulas: they provide the
+same `rbw` and `rbw-agent` binaries. Your existing configuration and vault data
+are preserved; continue using `rbw login` and your existing integrations.
+
+Linux face authorization is optional and deploys the bundled runtime only after
+you opt in; see "Face enrollment" below. macOS supports requester/remote use,
+not local Howdy enrollment. Homebrew uses a precompiled bottle when one is
+available for your platform; otherwise it builds rbwBio from source.
 
 ### Nix
 
@@ -71,8 +85,10 @@ it out via `nix-shell -p rbw`.
 
 ### Other
 
-With a working Rust installation, `rbw` can be installed via `cargo install
---locked rbw`. This requires that the
+With a working Rust installation, build rbwBio from this repository with
+`cargo install --locked --path .`, or use
+`cargo install --locked --git https://github.com/ylangs-fork/rbw`.
+The crate name remains `rbw`. This requires that the
 [`pinentry`](https://www.gnupg.org/related_software/pinentry/index.en.html)
 program is installed (to display password prompts). On GNU/Linux, PAM-backed
 local approval also requires PAM development files when building from source
@@ -149,14 +165,14 @@ agent is restarted (for example with `rbw stop-agent`).
 
 ### Face enrollment (GNU/Linux)
 
-Install the fork, then log in normally:
+Install rbwBio, then log in normally:
 
 ```sh
-brew install ylang-ylang/tap/rbw
+brew install ylang-ylang/tap/rbwbio
 rbw login
 ```
 
-After a successful interactive login, rbw asks once:
+After a successful interactive login, rbwBio asks once:
 
 ```text
 Enable face authorization for rbw? [y/N]
@@ -182,10 +198,12 @@ sends a secret-free desktop notification while recognition runs. Face failure,
 cancellation, notification delivery failure or a missing policy rejects access.
 Desktop Do Not Disturb can hide a notification even after the daemon accepts it.
 
-Failed enrollment is not saved as enabled. The bundled Linux x86_64 runtime
-targets Ubuntu 22.04/24.04; unsupported hardware/platforms are reported instead
-of silently enabling a fallback. Actual camera recognition still needs laptop
-verification; synthetic PAM smoke cannot prove face accuracy or spoof resistance.
+Failed enrollment is not saved as enabled. The bundled GNU/Linux x86_64 runtime
+requires glibc 2.35 or newer, including Ubuntu 22.04/24.04 and compatible
+Manjaro x86_64 installations. Unsupported hardware/platforms are reported
+instead of silently enabling a fallback. Actual camera recognition must be
+verified on the target laptop; synthetic PAM smoke cannot prove face accuracy
+or spoof resistance.
 
 Howdy is a convenience gate, not hardware-backed Face ID or protection against
 root. Its [security warning](https://github.com/boltgolt/howdy#a-note-on-security)

@@ -76,6 +76,8 @@ mod linux {
     const PAM_DIR: &str = "/etc/pam.d";
     const MARKER: &str =
         "# Managed by rbw setup; face authentication only.\n";
+    // Only this exact historical Python policy is eligible for migration.
+    const LEGACY_POLICY: &str = "#%PAM-1.0\nauth required pam_python3.so /usr/lib/security/howdy/pam.py\naccount required pam_permit.so\n";
     const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
     // Only distro-controlled system locations, never Homebrew, PATH, an
     // environment override, or a user-supplied module name.
@@ -140,12 +142,19 @@ mod linux {
         let existing_howdy = optional_module("pam_howdy.so")?;
         let permit = find_module("pam_permit.so")?;
         trusted_directory(Path::new(PAM_DIR))?;
-        let installed_policy = if let Some(howdy) = &existing_howdy {
-            policy_matches(&policy_text(howdy, &permit))?
-        } else {
-            ensure!(fs::symlink_metadata(POLICY).is_err(), "{POLICY} exists without a trusted native Howdy module; refusing to change it");
-            false
-        };
+        let original_policy = policy_contents()?;
+        let installed_policy = existing_howdy
+            .as_ref()
+            .zip(original_policy.as_deref())
+            .is_some_and(|(howdy, content)| {
+                content == policy_text(howdy, &permit)
+            });
+        ensure!(
+            original_policy.is_none()
+                || installed_policy
+                || original_policy.as_deref() == Some(LEGACY_POLICY),
+            "{POLICY} is not a recognized native or exact legacy policy; refusing to overwrite it. Have an administrator inspect it first"
+        );
         eprintln!("Face authorization keeps the master password for cold unlock. Howdy is a convenience check, not hardware-backed identity assurance.");
         eprintln!("rbw will request sudo only to deploy its prebuilt face runtime, configure its isolated policy and enroll your face. It never installs packages, builds code, or changes sudo/login PAM policies.");
 
@@ -189,7 +198,7 @@ mod linux {
             Some(Installer::stage()?)
         };
         let mut prepared = false;
-        let mut created_policy = None;
+        let mut changed_policy = None;
         let mut temporary_preference = false;
         let mut preference_written = false;
         let result = (|| -> anyhow::Result<()> {
@@ -218,7 +227,11 @@ mod linux {
                 .context("your desktop user cannot access the camera; no permission or group changes were made")?;
             let howdy = find_module("pam_howdy.so")?;
             let policy = policy_text(&howdy, &permit);
-            if !policy_matches(&policy)? {
+            ensure!(
+                policy_contents()? == original_policy,
+                "{POLICY} changed during enrollment; refusing to overwrite it"
+            );
+            if original_policy.as_deref() != Some(policy.as_str()) {
                 if previous.is_none() {
                     // A crash must not leave an unanswered legacy preference
                     // auto-detecting the policy before verification succeeded.
@@ -226,10 +239,14 @@ mod linux {
                     config.save()?;
                     temporary_preference = true;
                 }
-                let mut created = false;
-                let installation = install_policy(&policy, &mut created);
-                if created {
-                    created_policy = Some(policy);
+                let mut changed = false;
+                let installation = install_policy(
+                    &policy,
+                    original_policy.as_deref(),
+                    &mut changed,
+                );
+                if changed {
+                    changed_policy = Some(policy);
                 }
                 installation?;
             }
@@ -267,12 +284,17 @@ mod linux {
             Ok(())
         };
         let policy_rollback = if result.is_err() {
-            created_policy.map_or(Ok(()), |expected| -> anyhow::Result<()> {
+            changed_policy.map_or(Ok(()), |expected| -> anyhow::Result<()> {
                 ensure!(
                     policy_matches(&expected)?,
                     "newly installed policy changed; refusing rollback"
                 );
-                privileged("/usr/bin/rm", &["--".as_ref(), POLICY.as_ref()])?;
+                if let Some(original) = &original_policy {
+                    let mut restored = false;
+                    install_policy(original, Some(&expected), &mut restored)?;
+                } else {
+                    privileged("/usr/bin/rm", &["--".as_ref(), POLICY.as_ref()])?;
+                }
                 Ok(())
             })
         } else {
@@ -362,6 +384,9 @@ mod linux {
 
     const BUNDLE_ROOT: &str = "/usr/lib/security/rbw-howdy";
     const BUNDLE_PLATFORM: &str = "linux-x86_64-ubuntu22.04";
+    // Runtime releases have their own ABI/version lifecycle, independent of rbw.
+    const BUNDLE_VERSION: &str = "1.17.0";
+    const MIN_GLIBC: (u32, u32) = (2, 35);
 
     #[derive(serde::Deserialize)]
     struct BundleManifest {
@@ -374,7 +399,7 @@ mod linux {
         let manifest: BundleManifest =
             serde_json::from_str(include_str!("face-runtime.json"))?;
         ensure!(
-            manifest.version == env!("CARGO_PKG_VERSION")
+            manifest.version == BUNDLE_VERSION
                 && manifest.platform == BUNDLE_PLATFORM
                 && manifest.sha256.len() == 64
                 && manifest
@@ -480,22 +505,39 @@ mod linux {
         Ok(())
     }
 
+    fn require_bundle_abi() -> anyhow::Result<()> {
+        ensure!(cfg!(target_arch = "x86_64"), "prebuilt face runtime is unavailable on this architecture; no source-build fallback is provided");
+        // glibc owns this static NUL-terminated string. Query the linked libc
+        // directly: distro names, PATH and caller environment are not ABI proof.
+        let version = unsafe {
+            // SAFETY: glibc returns a permanent, non-null C string.
+            std::ffi::CStr::from_ptr(libc::gnu_get_libc_version())
+        }
+        .to_str()?;
+        let mut parts = version.split('.');
+        let major: u32 = parts
+            .next()
+            .context("missing glibc major version")?
+            .parse()?;
+        let minor: u32 = parts
+            .next()
+            .context("missing glibc minor version")?
+            .parse()?;
+        ensure!(
+            (major, minor) >= MIN_GLIBC,
+            "prebuilt face runtime requires GNU/Linux x86_64 with glibc >= {}.{} (found {version}); no package installation or source-build fallback is provided",
+            MIN_GLIBC.0,
+            MIN_GLIBC.1
+        );
+        Ok(())
+    }
+
     fn deploy_bundle() -> anyhow::Result<()> {
         let manifest = bundle_manifest()?;
+        require_bundle_abi()?;
         if fs::symlink_metadata(BUNDLE_ROOT).is_ok() {
             return installed_bundle(&manifest);
         }
-        ensure!(cfg!(target_arch = "x86_64"), "prebuilt face runtime is unavailable on this architecture; no source-build fallback is provided");
-        trusted_file(Path::new("/etc/os-release"))?;
-        let release = fs::read_to_string("/etc/os-release")?;
-        let value = |key: &str| {
-            release.lines().find_map(|line| {
-                line.strip_prefix(key).map(|value| value.trim_matches('"'))
-            })
-        };
-        ensure!(value("ID=") == Some("ubuntu")
-            && matches!(value("VERSION_ID="), Some("22.04" | "24.04")),
-            "prebuilt face runtime is available only for Ubuntu 22.04/24.04 x86_64; no package installation or source-build fallback is provided");
         let executable = fs::canonicalize(std::env::current_exe()?)?;
         let keg = executable
             .parent()
@@ -924,26 +966,42 @@ mod linux {
         Ok(file)
     }
 
-    fn policy_matches(expected: &str) -> anyhow::Result<bool> {
+    fn policy_contents() -> anyhow::Result<Option<String>> {
+        trusted_directory(Path::new(PAM_DIR))?;
         match fs::symlink_metadata(POLICY) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(false)
+                return Ok(None)
             }
             Err(e) => return Err(e).context("cannot inspect rbw PAM policy"),
-            Ok(metadata) => {
-                ensure!(
-                    metadata.is_file(),
-                    "{POLICY} is not a regular file; refusing to replace it"
-                );
-                ensure!(
-                    metadata.uid() == 0 && metadata.mode() & 0o7777 == 0o644 && metadata.nlink() == 1,
-                    "{POLICY} must be root-owned, mode 0644, and not hard-linked"
-                );
-            }
+            Ok(metadata) => validate_policy_metadata(&metadata)?,
         }
         let file = open_regular(Path::new(POLICY))?;
+        validate_policy_metadata(&file.metadata()?)?;
         let mut content = String::new();
-        file.take(16 * 1024).read_to_string(&mut content)?;
+        file.take(16 * 1024 + 1).read_to_string(&mut content)?;
+        ensure!(content.len() <= 16 * 1024, "{POLICY} is too large; refusing to replace it");
+        Ok(Some(content))
+    }
+
+    fn validate_policy_metadata(metadata: &Metadata) -> anyhow::Result<()> {
+        ensure!(
+            metadata.is_file(),
+            "{POLICY} is not a regular file; refusing to replace it"
+        );
+        ensure!(
+            metadata.uid() == 0
+                && metadata.gid() == 0
+                && metadata.mode() & 0o7777 == 0o644
+                && metadata.nlink() == 1,
+            "{POLICY} must be root:root, mode 0644, and not hard-linked"
+        );
+        Ok(())
+    }
+
+    fn policy_matches(expected: &str) -> anyhow::Result<bool> {
+        let Some(content) = policy_contents()? else {
+            return Ok(false);
+        };
         ensure!(
             content == expected,
             "{POLICY} is not the exact policy managed by this setup; refusing to overwrite it. \
@@ -1002,7 +1060,8 @@ mod linux {
 
     fn install_policy(
         expected: &str,
-        created: &mut bool,
+        previous: Option<&str>,
+        changed: &mut bool,
     ) -> anyhow::Result<()> {
         // The source lives in a private directory in the fixed system /tmp,
         // never TMPDIR. Even if the invoking user changes it concurrently, only
@@ -1051,6 +1110,7 @@ mod linux {
             "mktemp returned an unsafe staging path"
         );
         let stage = Path::new(stage);
+        let mut moved = false;
         let result = (|| -> anyhow::Result<()> {
             let metadata = fs::symlink_metadata(stage)?;
             ensure!(
@@ -1089,27 +1149,48 @@ mod linux {
             file.take(16 * 1024).read_to_string(&mut snapshot)?;
             ensure!(snapshot == expected, "temporary policy changed during installation; refusing to publish");
             trusted_directory(Path::new(PAM_DIR))?;
-            // No overwrite, including symlinks or a policy installed by another
-            // process after preflight. Only root can change either link parent.
-            if policy_matches(expected)? {
-                return Ok(());
+            // Recheck the full trusted snapshot immediately before publishing.
+            // A legacy migration atomically replaces only the recognized old
+            // policy, after enrollment and ordinary-user camera access succeed.
+            let current = policy_contents()?;
+            ensure!(
+                current.as_deref() == previous,
+                "{POLICY} changed during setup; refusing to overwrite it"
+            );
+            if previous.is_some() {
+                privileged(
+                    "/usr/bin/mv",
+                    &[
+                        "-T".as_ref(),
+                        "--".as_ref(),
+                        stage.as_os_str(),
+                        POLICY.as_ref(),
+                    ],
+                )?;
+                moved = true;
+            } else {
+                // No overwrite, including a policy appearing after preflight.
+                privileged(
+                    "/usr/bin/ln",
+                    &[
+                        "-T".as_ref(),
+                        "--".as_ref(),
+                        stage.as_os_str(),
+                        POLICY.as_ref(),
+                    ],
+                )?;
             }
-            privileged(
-                "/usr/bin/ln",
-                &[
-                    "-T".as_ref(),
-                    "--".as_ref(),
-                    stage.as_os_str(),
-                    POLICY.as_ref(),
-                ],
-            )?;
-            *created = true;
+            *changed = true;
             Ok(())
         })();
         // Never recursively delete a path and never act on unvalidated output.
         // The random staging path is confined to the trusted PAM directory.
-        let cleanup =
-            privileged("/usr/bin/rm", &["--".as_ref(), stage.as_os_str()]);
+        let cleanup = if moved {
+            Ok(())
+        } else {
+            privileged("/usr/bin/rm", &["--".as_ref(), stage.as_os_str()])
+                .map(|_| ())
+        };
         result?;
         cleanup.context(
             "policy installed, but root-owned staging-file cleanup failed",

@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.17.1] - 2026-11-19
+
+### Changed
+
+* Brand this fork as **rbwBio** and install it with
+  `brew install ylang-ylang/tap/rbwbio`. The crate, commands (`rbw` and
+  `rbw-agent`), configuration, vault data, profiles and integration names remain
+  unchanged. Existing tap installations migrate through Homebrew's formula rename.
+* Reuse the published 1.17.0 face runtime for GNU/Linux x86_64 with glibc 2.35
+  or newer. Normal `rbw login` keeps its default-No face authorization choice;
+  only opt-in runtime deployment avoids package installation and compilation.
+
+### Fixed
+
+* Migrate the exact legacy Python Howdy policy to native Howdy during opt-in
+  activation, restoring it on failure. Unrecognized administrator policies and
+  existing Howdy enrollment data are left untouched.
+
 ## [1.17.0] - 2026-11-19
 
 ### Added
