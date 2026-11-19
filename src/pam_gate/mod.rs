@@ -261,7 +261,6 @@ impl Drop for ProcessGroup {
     }
 }
 
-#[cfg(any(all(target_os = "linux", target_env = "gnu"), test))]
 fn validate_prompt(title: &str, description: &str) -> anyhow::Result<()> {
     const MAX_PROMPT_LEN: usize = 1024;
     for value in [title, description] {
