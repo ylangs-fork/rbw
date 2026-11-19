@@ -5,6 +5,7 @@ use clap::{CommandFactory as _, Parser as _};
 
 mod actions;
 mod commands;
+mod setup;
 mod sock;
 
 #[derive(Debug, clap::Args)]
@@ -22,6 +23,27 @@ struct FindArgs {
 #[derive(Debug, clap::Parser)]
 #[command(version, about = "Unofficial Bitwarden CLI")]
 enum Opt {
+    #[command(
+        about = "Check or install the isolated Linux Howdy face-authentication policy",
+        long_about = "Check Linux Howdy face-authentication prerequisites without \
+            authenticating or changing files. Use --apply to explicitly install \
+            only /etc/pam.d/rbw-device-auth; sudo/login policies are never changed. \
+            Camera access and face enrollment require separate Howdy setup."
+    )]
+    Setup {
+        #[arg(
+            long,
+            conflicts_with = "apply",
+            help = "Read-only configuration check (the default); hardware remains unverified"
+        )]
+        check: bool,
+        #[arg(
+            long,
+            help = "Explicitly install the isolated root-owned PAM policy; may request sudo"
+        )]
+        apply: bool,
+    },
+
     #[command(about = "Get or set configuration options")]
     Config {
         #[command(subcommand)]
@@ -257,6 +279,7 @@ impl Opt {
             Self::Config { config } => {
                 format!("config {}", config.subcommand_name())
             }
+            Self::Setup { .. } => "setup".to_string(),
             Self::Register => "register".to_string(),
             Self::Login => "login".to_string(),
             Self::Unlock { .. } => "unlock".to_string(),
@@ -377,6 +400,7 @@ fn main() {
 
     let subcommand_name = opt.subcommand_name();
     let res = match opt {
+        Opt::Setup { check: _, apply } => setup::run(apply),
         Opt::Config { config } => match config {
             Config::Show => commands::config_show(),
             Config::Set { key, value } => commands::config_set(&key, &value),
@@ -620,5 +644,37 @@ mod tests {
         assert!(
             Opt::try_parse_from(["rbw", "auth-request", "reject"]).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn setup_defaults_to_read_only_and_accepts_explicit_modes() {
+        assert!(matches!(
+            Opt::try_parse_from(["rbw", "setup"]),
+            Ok(Opt::Setup {
+                check: false,
+                apply: false
+            })
+        ));
+        assert!(matches!(
+            Opt::try_parse_from(["rbw", "setup", "--check"]),
+            Ok(Opt::Setup {
+                check: true,
+                apply: false
+            })
+        ));
+        assert!(matches!(
+            Opt::try_parse_from(["rbw", "setup", "--apply"]),
+            Ok(Opt::Setup {
+                check: false,
+                apply: true
+            })
+        ));
+        assert!(Opt::try_parse_from(["rbw", "setup", "--check", "--apply"])
+            .is_err());
     }
 }

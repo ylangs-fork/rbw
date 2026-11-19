@@ -33,17 +33,37 @@ impl SshAgent {
             .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
             .to_string();
         let policy = self.config.policy_for(&fingerprint);
-        let l1_alive = self.state.lock().await.l1_alive();
+        let (l1_alive, mut cancellation) = {
+            let state = self.state.lock().await;
+            (state.l1_alive(), state.cancellation())
+        };
         let gate = rbw::pam_gate::PamGate::detect();
 
         match policy_decision(policy, l1_alive, gate.is_some()) {
             GateDecision::Allow => Ok(()),
             GateDecision::Authorize => {
-                gate.ok_or_else(|| anyhow::anyhow!("PAM gate unavailable"))?
-                    .authorize()
-                    .await?;
-                // HOOK(state-machine): B3 supplies the real bio heartbeat.
-                self.state.lock().await.record_bio_success();
+                // Face authorization cannot establish or revive a cold session.
+                if !l1_alive {
+                    return Err(anyhow::anyhow!("agent is locked"));
+                }
+                let gate = gate
+                    .ok_or_else(|| anyhow::anyhow!("PAM gate unavailable"))?;
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(anyhow::anyhow!(
+                            "agent locked during local authentication"
+                        ));
+                    }
+                    result = gate.authorize() => result?,
+                }
+                let mut state = self.state.lock().await;
+                if cancellation.is_cancelled() || !state.l1_alive() {
+                    return Err(anyhow::anyhow!(
+                        "agent locked during local authentication"
+                    ));
+                }
+                state.record_bio_success();
                 Ok(())
             }
             GateDecision::Deny => Err(anyhow::anyhow!(

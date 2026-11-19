@@ -77,6 +77,12 @@ fn create_ssh_agent_fixture() {
     config.pinentry = pinentry;
     config.ssh_agent.enabled = true;
     config.ssh_agent.default_policy = rbw::config::SshAgentPolicy::L1;
+    let face_smoke = std::env::var_os("RBW_E2E_FACE_SMOKE").is_some();
+    if face_smoke {
+        config.l1_timeout = 8;
+        config.sync_interval = 0;
+        config.ssh_agent.default_policy = rbw::config::SshAgentPolicy::Always;
+    }
     config.save().unwrap();
 
     let mut db = rbw::db::Db::new();
@@ -103,5 +109,34 @@ fn create_ssh_agent_fixture() {
         key: None,
         master_password_reprompt: rbw::api::CipherRepromptType::None,
     });
+    if face_smoke {
+        let encrypt = |plaintext: &[u8]| {
+            rbw::cipherstring::CipherString::encrypt_symmetric(
+                &user_key, plaintext,
+            )
+            .unwrap()
+            .to_string()
+        };
+        db.entries.push(rbw::db::Entry {
+            id: "e8b2cf42-8700-4f48-bb29-83b81b147de1".to_string(),
+            org_id: None,
+            folder: None,
+            folder_id: None,
+            name: encrypt(b"Face smoke synthetic login"),
+            data: rbw::db::EntryData::Login {
+                username: None,
+                password: Some(encrypt(
+                    b"face-smoke-synthetic-secret-8e8edc",
+                )),
+                totp: None,
+                uris: Vec::new(),
+            },
+            fields: Vec::new(),
+            notes: None,
+            history: Vec::new(),
+            key: None,
+            master_password_reprompt: rbw::api::CipherRepromptType::None,
+        });
+    }
     db.save(config.server_name().as_str(), email).unwrap();
 }

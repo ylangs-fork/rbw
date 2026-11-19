@@ -50,7 +50,14 @@ You can install it using `sudo dnf install rbw`.
 
 ### Homebrew
 
-`rbw` is available in the [Homebrew repository](https://formulae.brew.sh/formula/rbw). You can install it via `brew install rbw`.
+Install this fork from its own tap, not `homebrew/core`:
+
+```sh
+brew install ylang-ylang/tap/rbw
+```
+
+Linux face authorization uses the system's Howdy installation; see
+"Face setup" below. macOS builds support requester/remote use, not Howdy.
 
 ### Nix
 
@@ -136,6 +143,58 @@ When L1 expires, `rbw lock` is run, or the agent exits, the in-memory User Key
 and organization keys are cleared. Configuration changes take effect after the
 agent is restarted (for example with `rbw stop-agent`).
 
+### Face setup (GNU/Linux)
+
+**Howdy face recognition is the only supported biometric setup backend.**
+Fingerprint setup and automatic edits to sudo/login authentication are not
+provided. Master Password remains the cold-unlock path; face authorization
+only permits operations within an already unlocked session and renews it.
+
+Install the distribution's current Howdy package with the native
+`pam_howdy.so` module, select its IR camera, and enroll a face for your normal
+Linux user. These hardware-specific dependencies and face models are not
+included in the Homebrew package. Follow the
+[Howdy installation guide](https://github.com/boltgolt/howdy#installation);
+camera selection and enrollment are a one-time prerequisite, not something
+rbw can verify without a camera.
+
+After configuring Howdy, run as your normal user:
+
+```sh
+rbw setup --apply
+rbw setup --check
+rbw stop-agent
+rbw unlock
+rbw get <entry>
+```
+
+`setup` and `setup --check` are read-only. `--apply` explicitly installs only
+the root-owned, mode-0644 `/etc/pam.d/rbw-device-auth` policy, using the trusted
+native Howdy module. It does not overwrite an administrator's unrelated policy,
+change sudo/login, enroll a face, or elevate the rbw agent. Reapplying the
+same managed policy is safe. Restart the agent to select the new local mode.
+
+A successful preflight means the integration files are configured, **not**
+that a real face was recognized. Check a real match and a non-match on the
+laptop before relying on it. Face failure, cancellation, a missing module,
+or policy removal must reject secret access, never silently enable remote mode
+in a running local agent.
+
+Howdy is a convenience gate, not hardware-backed Face ID or a defense against
+root. Its upstream
+[security warning](https://github.com/boltgolt/howdy#a-note-on-security)
+explicitly notes spoofing risks. Keep the normal system password and Master
+Password recovery paths.
+
+### No-hardware face smoke
+
+The Docker smoke in `tests/face_setup_smoke.sh` runs the real CLI, agent,
+PAM transaction, and encrypted offline fixture. Its test image alone supplies
+a synthetic `pam_howdy.so` to produce success, rejection, cancellation and
+blocking behavior. It cannot validate camera drivers, face matching, liveness,
+false accepts, or the laptop's camera/model permissions. No simulator or
+authorization bypass is installed by the Homebrew formula.
+
 ### Profiles
 
 `rbw` supports different configuration profiles, which can be switched
@@ -193,17 +252,10 @@ is not a regular root-owned file, or is writable by group or other users. It
 does not fall back to `/etc/pam.d/other` or allow the service name to be changed
 through rbw configuration or the environment.
 
-For example, a fingerprint-only policy using `pam_fprintd` can contain:
-
-```pam
-#%PAM-1.0
-auth required pam_fprintd.so
-account required pam_permit.so
-```
-
-A password policy can use `pam_unix.so`, while a face-recognition system such as
-Howdy can install its own PAM module instead. Exact module names and control
-flags are distribution-specific and remain a system-administrator decision.
+For face authorization, `rbw setup --apply` installs a dedicated policy using
+the root-controlled native Howdy module. The policy uses `auth required` for
+Howdy and a separate account-management rule; a face failure cannot fall back
+to a permissive authentication module.
 Keep the policy root-owned and not writable by group or other users (typically
 mode `0644`). PAM secret prompts are displayed through rbw's configured
 pinentry together with the validated request UUID and locally derived five-word
@@ -288,14 +340,15 @@ Policies are:
 * `always`: require a fresh local PAM authorization for every signature. If the
   PAM gate is unavailable, signing fails closed. Remote approval for this case
   is a separate integration phase.
-* `l1` (default): allow while the rbw agent is already unlocked; otherwise
-  require PAM and fail closed if it is unavailable.
+* `l1` (default): allow while the rbw agent is already unlocked. An expired or
+  locked session must first be unlocked normally; face authorization cannot
+  recreate a cold session.
 * `never`: do not add an authorization gate beyond access to the unlocked rbw
   agent.
 
-The PAM service is `/etc/pam.d/rbw-device-auth`; its root-owned policy can use
-`pam_fprintd`, Howdy, a password module, or another administrator-selected PAM
-module.
+The dedicated PAM service is `/etc/pam.d/rbw-device-auth`. Use `rbw setup` to
+configure its native Howdy face policy. Existing administrator-controlled PAM
+policies remain the local trust authority, not a hardware attestation.
 
 #### sudo with the rbw SSH agent
 

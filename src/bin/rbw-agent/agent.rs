@@ -242,13 +242,13 @@ pub async fn gate_sensitive_action(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    let pam_gate_required = {
+    let (pam_gate_required, mut cancellation) = {
         let mut state = state.lock().await;
         if !state.l1_alive() {
             state.clear();
             return Err(anyhow::anyhow!("agent is locked"));
         }
-        state.pam_gate_required()
+        (state.pam_gate_required(), state.cancellation())
     };
 
     if !pam_gate_required {
@@ -258,16 +258,27 @@ pub async fn gate_sensitive_action(
     // The mode was selected at startup. Revalidate the policy for every
     // authorization and fail closed if the local policy disappears or becomes
     // insecure instead of dynamically downgrading to the remote bypass mode.
-    rbw::pam_gate::PamGate::new()?
-        .with_context(
-            environment.clone(),
-            "Authorize rbw secret access",
-            "Confirm that you are present to access rbw secrets",
-        )?
-        .authorize()
-        .await?;
+    let gate = rbw::pam_gate::PamGate::new()?.with_context(
+        environment.clone(),
+        "Authorize rbw secret access",
+        "Confirm that you are present to access rbw secrets",
+    )?;
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            return Err(anyhow::anyhow!(
+                "agent locked during local authentication"
+            ));
+        }
+        result = gate.authorize() => result?,
+    }
 
     let mut state = state.lock().await;
+    if cancellation.is_cancelled() {
+        return Err(anyhow::anyhow!(
+            "agent locked during local authentication"
+        ));
+    }
     if !state.l1_alive() {
         state.clear();
         return Err(anyhow::anyhow!(

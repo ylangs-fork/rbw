@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.16.0] - 2026-11-19
 
 ## Added
 
@@ -8,6 +8,12 @@
   approval and rejection of authentication requests. Pending requests can be
   selected by list number or request ID; the ID can be omitted when only one
   request is pending.
+* Added `rbw setup` with read-only preflight and explicit `--apply` installation
+  of a dedicated Howdy face-authorization policy on GNU/Linux. Native Howdy is
+  the sole supported biometric setup backend; sudo/login policies and the
+  Master Password cold-unlock path are unchanged.
+* Added an isolated no-hardware face smoke using real CLI/agent/PAM flows and
+  synthetic test-only face decisions. This is not a real-camera validation.
 * Added an optional `unlock_helper` configuration field. When set, the
   configured command is invoked (with an empty environment, no stdin, and a
   30-second timeout) during `rbw unlock` before pinentry is consulted. The
@@ -35,9 +41,8 @@
   material if the agent is unexpectedly attached to or the sentinel is
   killed. This raises the cost of generic memory-scanning tools that look
   for a contiguous key-shaped value; it is not a boundary against an
-  attacker who has reverse-engineered this specific layout and can attach a
-  debugger without changing `TracerPid` (for example, reading
-  `/proc/<pid>/mem` directly).
+  attacker who knows the layout and can read the process, including direct
+  `/proc/<pid>/mem` access that does not change `TracerPid`.
 * Decrypted entry secrets (`rbw get` output, SSH agent responses) are now
   held in a self-zeroizing buffer inside the agent process instead of a
   plain `String`, reducing how long plaintext may remain resident in the
@@ -51,6 +56,11 @@
   without a secure PAM policy use a non-renewable session capped at ten
   minutes. See the README's "Local authorization sessions" section for
   details.
+
+## Fixed
+
+* Locking an agent now cancels a pending secret-access PAM authorization and
+  prevents its late result from renewing a subsequently unlocked session.
 
 ## [1.15.0] - 2025-12-31
 
