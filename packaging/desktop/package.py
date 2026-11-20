@@ -166,7 +166,7 @@ def package():
         for path in sorted(root.rglob('*'), reverse=True) + [root]:
             os.utime(path, (epoch, epoch))
         artifact = output / ('rbwbio_' + version + '_amd64.deb')
-        run('dpkg-deb', '--root-owner-group', '-Zxz', '-z9', '--build', root, artifact)
+        run('dpkg-deb', '--root-owner-group', '-Zxz', '-z3', '--build', root, artifact)
     build.update({'filename': artifact.name, 'sha256': digest(artifact)})
     write(output / 'artifact.json', json.dumps(build, indent=2) + '\n')
     write(output / (artifact.name + '.sha256'), build['sha256'] + '  ' + artifact.name + '\n')

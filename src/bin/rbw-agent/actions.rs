@@ -972,6 +972,7 @@ async fn complete_auth_request_approval(
     let result = async {
         let mut approval = prepared?;
         let canonical_request_id = approval.request_id.to_string();
+        crate::request_ui::start(state.clone(), environment).await?;
         ensure_not_cancelled(&approval.cancellation)?;
         cancel_or(
             &mut approval.cancellation,

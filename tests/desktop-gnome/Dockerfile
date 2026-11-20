@@ -19,6 +19,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       python3 python3-gi gir1.2-glib-2.0 curl ca-certificates \
       procps util-linux tini socat \
     && useradd --create-home --uid 1100 --shell /bin/bash desktop \
+    && rmdir /run/systemd/seats \
+    && install -d -o desktop -g desktop /home/desktop/.cache \
     && install -d -m 0700 -o desktop -g desktop /run/user/1100 \
     && install -d -o desktop -g desktop /home/desktop/.cache/desktop-gnome \
        /home/desktop/.local/share/applications /home/desktop/.config \

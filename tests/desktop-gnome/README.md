@@ -6,8 +6,10 @@ There is deliberately **no StatusNotifierWatcher, appindicator extension or tray
 host**. The session bus, system bus, home, browser profile and display are private
 to the container. It does not access the host desktop, Waybar, extensions, PAM,
 cameras, vault or credentials. It is a Shell session under `dbus-run-session`, not
-a full systemd/login-manager installation. This exercises Shell launch/search and
-notifications; it does not establish login-session, hardware or human-PAM assurance.
+a full systemd/login-manager installation. The image removes apt's empty
+`/run/systemd/seats` directory so Shell uses its native non-logind session mode.
+This exercises Shell launch/search and notifications; it does not establish
+login-session, hardware or human-PAM assurance.
 
 No application binary is built here. The parent supplies the actual installed
 package and an architecture-matching, precompiled Chrome/Chromium directory. There

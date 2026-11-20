@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 [[ $(id -u) == 1100 ]] || { echo 'Refusing root or non-test-user browser.' >&2; exit 1; }
-: "${GNOME_TEST_BROWSER:?Missing precompiled browser path}"
+: "${GNOME_TEST_BROWSER:=/opt/browser/chrome}"
 args=(
     --user-data-dir="$HOME/.cache/desktop-gnome/chrome-profile"
     --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
