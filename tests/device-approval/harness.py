@@ -159,7 +159,8 @@ class Harness:
         if not plaintext:
             self.check_private(result.stdout)
         require((result.returncode == 0) == success,
-                "CLI " + role + " " + args[0] + " had unexpected exit " + str(result.returncode))
+                "CLI " + role + " " + args[0] + " had unexpected exit " +
+                str(result.returncode) + ": " + result.stderr.decode(errors="replace").strip()[:800])
         if not success:
             require(result.stdout == b"", "denied CLI emitted output")
         return result
@@ -431,7 +432,8 @@ class Harness:
         first = self.new_request()
         for asset in ("", "app.js", "style.css"):
             response = self.ui(asset)
-            require(response[0] == 200 and response[1], "request-page asset unavailable")
+            require(response[0] == 200 and response[1],
+                    "request-page asset " + (asset or "index") + " unavailable (HTTP " + str(response[0]) + ")")
         self.cli("approver", "auth-request", "list", "--raw")
         receipt = self.profiles["approver"]["home"] / "notifications"
         def notification():
@@ -616,9 +618,11 @@ class Harness:
                 "refusing cleanup for a different account")
         self.account["account_id"] = field(profile, "id")
         self.save_recovery()
-        status, _ = http(self.server + "/api/accounts/delete", "POST",
-                         {"masterPasswordHash": self.account["password_hash"]}, token)
-        require(200 <= status < 300, "authenticated synthetic account deletion failed")
+        status, raw = http(self.server + "/api/accounts/delete", "POST",
+                           {"masterPasswordHash": self.account["password_hash"]}, token)
+        category = "invalid-password" if b"Invalid password" in raw else "unclassified"
+        require(200 <= status < 300, "authenticated synthetic account deletion failed (HTTP " +
+                str(status) + ", " + category + ")")
         # The same normal authenticated profile endpoint must now reject its token.
         require(http(self.server + "/api/accounts/profile", token=token)[0] in (400, 401, 403, 404),
                 "deleted synthetic account still authenticates")
@@ -680,6 +684,7 @@ def main():
         harness.prepare_profiles()
         harness.register()
         harness.exercise()
+        harness.ordinary_cli_approval()
     except Exception as error:
         # Never interpolate raw HTTP, CLI, JSON or crypto exception strings.
         failure = str(error) if isinstance(error, Failure) else (
@@ -687,8 +692,10 @@ def main():
     finally:
         try:
             harness.close()
-        except Exception:
-            print("device-approval: cleanup incomplete; private account-recovery.json retained", file=sys.stderr)
+        except Exception as error:
+            reason = str(error) if isinstance(error, Failure) else type(error).__name__
+            print("device-approval: cleanup incomplete [" + reason +
+                  "]; private account-recovery.json retained", file=sys.stderr)
             failure = failure or "synthetic account cleanup failed"
     if failure:
         print("device-approval: FAIL: " + failure, file=sys.stderr)

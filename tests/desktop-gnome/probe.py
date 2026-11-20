@@ -37,12 +37,20 @@ def main():
             raise RuntimeError(f"Real GNOME service not ready: {name}")
         owner = bus_call("GetNameOwner", name)
         pid = bus_call("GetConnectionUnixProcessID", owner)
-        if pid != args.shell_pid:
-            raise RuntimeError(f"{name} is not owned by the launched GNOME Shell")
-        if Path(f"/proc/{pid}/exe").resolve().name != "gnome-shell":
-            raise RuntimeError("Notification provider is not the GNOME Shell executable")
+        executable = Path(f"/proc/{pid}/exe").resolve().name
+        if name == "org.gnome.Shell":
+            if pid != args.shell_pid or executable != "gnome-shell":
+                raise RuntimeError("The service is not owned by the launched GNOME Shell")
+        elif pid != args.shell_pid:
+            # GNOME 46 delegates the public service to its shipped GJS proxy.
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            script = b"/usr/share/gnome-shell/org.gnome.Shell.Notifications"
+            if Path(f"/proc/{pid}/exe").resolve() != Path("/usr/bin/gjs").resolve() or script not in command:
+                raise RuntimeError("Notification provider is not the native GNOME proxy")
+            if bus_call("GetNameOwner", "org.gnome.Shell.Notifications") != owner:
+                raise RuntimeError("Notification proxy service identity does not match")
         if Path(f"/proc/{pid}").stat().st_uid != 1100:
-            raise RuntimeError("GNOME Shell is not running as the ordinary test user")
+            raise RuntimeError("GNOME services are not running as the ordinary test user")
         owners[name] = pid
     watchers = {name: bus_call("NameHasOwner", name) for name in (
         "org.kde.StatusNotifierWatcher", "org.freedesktop.StatusNotifierWatcher")}

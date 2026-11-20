@@ -89,8 +89,8 @@ docker exec --user desktop "$container" /opt/desktop-gnome/desktop.sh \
 Startup prints `GNOME_DESKTOP_READY` only after checking all of:
 
 - X11 has GNOME Shell as its actual window manager.
-- Shell and Notifications D-Bus names belong to the launched `gnome-shell` PID,
-  running as uid 1100, not a mock notification daemon.
+- Shell's D-Bus name belongs to the launched `gnome-shell` PID; notifications
+  belong to Shell or its shipped GJS notification proxy, all running as uid 1100.
 - `GetServerInformation` and `GetCapabilities` succeed; `actions` is advertised.
 - Neither standard StatusNotifierWatcher name has an owner.
 - The headed browser's real loopback CDP `/json/version` responds.

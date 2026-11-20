@@ -96,7 +96,6 @@ async fn initialize(state: AgentState, environment: &Environment) -> anyhow::Res
         tray,
     });
     let routes = Router::new()
-        .route("/", get(index))
         .route("/style.css", get(styles))
         .route("/app.js", get(script))
         .route("/api/state", get(snapshot))
@@ -105,7 +104,8 @@ async fn initialize(state: AgentState, environment: &Environment) -> anyhow::Res
         .route("/api/requests/{kind}/{id}/{action}", post(decide))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(hub.clone());
-    let app = Router::new().nest(&format!("/{token}"), routes)
+    let app = Router::new().route(&format!("/{token}/"), get(index))
+        .nest(&format!("/{token}"), routes)
         .layer(middleware::from_fn_with_state(hub.clone(), protect));
     tokio::spawn(async move {
         if axum::serve(listener, app).await.is_err() { log::error!("rbwBio request page stopped"); }

@@ -8,7 +8,7 @@ ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-      gnome-shell gnome-session-bin gnome-settings-daemon gnome-backgrounds \
+      gnome-shell gjs gnome-session-bin gnome-settings-daemon gnome-backgrounds \
       gsettings-desktop-schemas adwaita-icon-theme \
       dbus dbus-x11 dbus-user-session accountsservice upower \
       xvfb xauth x11-utils x11-xserver-utils xdotool scrot \
@@ -23,6 +23,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && install -d -o desktop -g desktop /home/desktop/.cache \
     && install -d -m 0700 -o desktop -g desktop /run/user/1100 \
     && install -d -o desktop -g desktop /home/desktop/.cache/desktop-gnome \
+       /home/desktop/.local /home/desktop/.local/share \
        /home/desktop/.local/share/applications /home/desktop/.config \
     && install -d /opt/desktop-gnome
 COPY entrypoint.sh session.sh desktop.sh browser.sh probe.py /opt/desktop-gnome/
