@@ -972,7 +972,6 @@ async fn complete_auth_request_approval(
     let result = async {
         let mut approval = prepared?;
         let canonical_request_id = approval.request_id.to_string();
-        crate::request_ui::start(state.clone(), environment).await?;
         ensure_not_cancelled(&approval.cancellation)?;
         cancel_or(
             &mut approval.cancellation,
@@ -1055,6 +1054,7 @@ pub async fn approve_auth_request(
         let (approval, request) =
             prepare_auth_request_approval(state.clone(), request_id, None)
                 .await?;
+        crate::request_ui::start(state.clone(), environment).await?;
         sock.send(&rbw::protocol::Response::AuthRequestApproval { request })
             .await?;
         Ok(approval)
