@@ -77,12 +77,13 @@ def cleanup_manifest(path):
             headers["Authorization"] = "Bearer " + token
         req = urllib.request.Request(server + route, data=data, headers=headers)
         try:
-            with opener.open(req, timeout=10) as response:
+            with opener.open(req, timeout=30) as response:
                 return response.status, response.read(1024 * 1024)
         except urllib.error.HTTPError as error:
             return error.code, error.read(1024 * 1024)
-        except OSError:
-            raise Failure("cleanup HTTP transport failed (private details suppressed)") from None
+        except OSError as error:
+            raise Failure("cleanup HTTP transport failed [" + type(error).__name__ +
+                          "] (private details suppressed)") from None
     token = account.get("token")
     status, raw = request("/api/accounts/profile", token=token) if token else (401, b"")
     if not 200 <= status < 300:
@@ -105,7 +106,7 @@ def cleanup_manifest(path):
     pending = account.get("auth_request_ids", [])
     require(isinstance(pending, list) and all(isinstance(value, str) and
             str(uuid.UUID(value)) == value for value in pending), "invalid cleanup request IDs")
-    deadline = time.monotonic() + 400
+    deadline = time.monotonic() + 1000
     while pending:
         remaining = []
         for request_id in pending:
@@ -187,9 +188,9 @@ def main():
         # The driver prints only safe phases/UUID/fingerprint metadata, not CLI/server output.
         attached = subprocess.Popen(["docker", "start", "--attach", runner_name], stdin=subprocess.DEVNULL)
         try:
-            outcome = attached.wait(timeout=600)
+            outcome = attached.wait(timeout=1500)
         except subprocess.TimeoutExpired:
-            raise Failure("full protocol acceptance exceeded 600 seconds") from None
+            raise Failure("full protocol acceptance exceeded 1500 seconds") from None
     finally:
         # Graceful TERM gives Python a chance to delete the synthetic account.
         # No globally named service, host profile, PAM file or unrelated container is touched.

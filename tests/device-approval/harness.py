@@ -73,12 +73,13 @@ def http(url, method="GET", body=None, token=None, form=False, origin=None):
         headers.update({"Origin": origin, "Sec-Fetch-Site": "same-origin"})
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with HTTP.open(request, timeout=8) as response:
+        with HTTP.open(request, timeout=30) as response:
             return response.status, response.read(2 * 1024 * 1024)
     except urllib.error.HTTPError as error:
         return error.code, error.read(2 * 1024 * 1024)
-    except (OSError, ValueError):
-        raise Failure("HTTP transport failed (response and URL suppressed)") from None
+    except (OSError, ValueError) as error:
+        raise Failure("HTTP transport failed [" + type(error).__name__ +
+                      "] (response and URL suppressed)") from None
 
 
 def parsed(response, label):
@@ -231,13 +232,22 @@ class Harness:
                                                serialization.NoEncryption())
         public_der = account_key.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        verification = http(self.server + "/identity/accounts/register/send-verification-email",
+                            "POST", {"email": self.email, "name": "rbwBio synthetic device acceptance"})
+        require(verification[0] != 204,
+                "server requires email verification; no disposable account was created")
+        verification_token = parsed(verification, "synthetic registration verification")
+        require(isinstance(verification_token, str) and verification_token,
+                "server did not return a normal registration verification token")
+        self.private.append(verification_token.encode())
         self.account = {"server": self.server, "email": self.email, "run_id": self.identifier,
                         "auth_request_ids": [],
                         "password_hash": password_hash, "token": None, "account_id": None,
                         "registration_attempted": True, "registered": False}
         self.save_recovery()
-        registration = http(self.server + "/api/accounts/register", "POST", {
+        registration = http(self.server + "/identity/accounts/register/finish", "POST", {
             "email": self.email, "name": "rbwBio synthetic device acceptance",
+            "emailVerificationToken": verification_token,
             "masterPasswordHash": password_hash, "key": encrypted(stretched, user_key),
             "kdf": 0, "kdfIterations": 600000,
             "keys": {"publicKey": b64(public_der),
@@ -632,7 +642,7 @@ class Harness:
         pending = list(self.account.get("auth_request_ids", []))
         if pending:
             phase("waiting for normal server expiry before authenticated account deletion")
-        deadline = time.monotonic() + 400
+        deadline = time.monotonic() + 1000
         while pending:
             remaining = []
             for request_id in pending:

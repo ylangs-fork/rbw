@@ -41,20 +41,21 @@ python3 tests/device-approval/run.py --server-image vaultwarden/server:1.35.0
 
 Registration uses the server's normal defaults. No registration override, admin
 token, email-verification override, database injection or server patch is used.
+It uses the normal identity registration verification-token and finish endpoints.
+If the server requires emailed verification, it stops without creating an account.
 The server's data directory is its own tmpfs. No ports are published, no Docker
 socket/home/config/PAM/device is mounted, and no privileged container is needed.
 Only a fresh private artifact directory is bind-mounted for cleanup recovery.
 Images must already be available or pullable; Docker setup commands have finite
-120-second deadlines. The complete attached acceptance run has a 600-second
+120-second deadlines. The complete attached acceptance run has a 1500-second
 deadline, with a separate bounded graceful-cleanup window.
 
 ## Deliberate external-server mode
 
-**Not executed by this assignment.** The parent can explicitly authorize one
-new disposable synthetic account on TN with:
+Explicitly authorize a new disposable synthetic account on your server:
 
 ```sh
-python3 tests/device-approval/run.py --server https://vault-tnl.csylang.uk
+python3 tests/device-approval/run.py --server https://vault.example.org
 ```
 
 `--server` never starts/reconfigures a Vaultwarden server. HTTPS is required
@@ -70,7 +71,8 @@ email is `rbwbio-device-<fresh UUID>@example.invalid`.
 
 1. Generate a real PBKDF2-SHA256 identity (600,000 iterations), random 64-byte
    User Key, RSA account key pair, Bitwarden type-2 AES-CBC/HMAC encrypted account
-   keys, and an encrypted synthetic login item. Register via the ordinary API.
+   keys, and an encrypted synthetic login item. Register through the normal
+   identity verification-token and finish flow.
 2. Start two independent non-root rbw profiles, each with its own HOME, config,
    cache, device identifier, runtime/socket, foreground agent, session bus and
    actionable freedesktop notification fixture. Log both into that synthetic
@@ -124,14 +126,14 @@ email is `rbwbio-device-<fresh UUID>@example.invalid`.
     authenticated profile email/UUID. Require its token to stop authenticating.
     Remove this run's containers/network/private temporary data.
 
-Vaultwarden 1.35.0 retains approved auth requests until its normal five-minute
-purge. Before deleting the account, the harness waits up to 400 seconds for its
-own recorded request IDs to disappear through authenticated GETs. This avoids
-deleting a user while dependent requests still exist; no cron override, SQL
-cleanup, server patch or administrator endpoint is used. Private recovery records
-retain those IDs and the same bounded expiry wait.
+Vaultwarden 1.35.0 retains approved auth requests for five minutes; current
+revision 46ae59ea retains them for fifteen minutes. Before deleting the account,
+the harness waits up to 1000 seconds for its own recorded request IDs to disappear
+through authenticated GETs. No cron override, SQL cleanup, server patch or
+administrator endpoint is used. Private recovery records retain those IDs and
+the same bounded expiry wait.
 
-HTTP calls have 8-second timeouts; CLI commands 20 seconds (5 for stopping);
+HTTP calls have 30-second timeouts; CLI commands 20 seconds (5 for stopping);
 readiness/discovery has bounded polling; requester completion has 25 seconds.
 The gated native PAM fixture independently denies after 30 seconds. Delays do
 not turn a negative case into success: hangs and wrong exit codes fail the run.
@@ -164,12 +166,25 @@ credentials.
 
 - [Vaultwarden 1.35.0 registration, account deletion and auth-request routes](https://github.com/dani-garcia/vaultwarden/blob/1.35.0/src/api/core/accounts.rs)
 - [Vaultwarden 1.35.0 password-or-OTP account-delete validation](https://github.com/dani-garcia/vaultwarden/blob/1.35.0/src/api/mod.rs)
+- [TN revision 46ae59ea identity registration and verification policy](https://github.com/dani-garcia/vaultwarden/blob/46ae59ea/src/api/identity.rs)
 - Current repository `src/api.rs`, `src/identity.rs`, `src/cipherstring.rs` and
   `src/device_auth.rs` define the actual client wire/crypto formats.
 - `tests/ssh_agent_e2e_fixture.rs`, `tests/pam_howdy_smoke.c` and
-  `tests/face_smoke_notifications.py` informed the disposable fixtures; none of
-  those existing files is changed. Unlike the offline SSH fixture, this harness
-  registers, logs in and creates the encrypted item on a real server.
+  `tests/face_smoke_notifications.py` informed the disposable fixtures. Unlike the
+  offline SSH fixture, this harness registers, logs in and creates the encrypted
+  item on a real server.
 
-No build, runtime acceptance, TN access, actual human PAM authentication or
-camera/hardware verification was executed while implementing these new files.
+## Recorded acceptance (2026-11-20)
+
+- Isolated Vaultwarden 1.35.0: encrypted roundtrip, negative cases, ordinary CLI
+  approval and authenticated account deletion passed.
+- Real GNOME 46: notification Open reached the exact pending request; explicit
+  fingerprint review and browser approval traversed native test PAM and server
+  acceptance, followed by exact requester decryption. Browser-local synthetic RGB
+  video played, and its track ended on cancellation.
+- External revision 46ae59ea: actual device approval, exact requester decryption,
+  read-only discovery and incorrect-fingerprint rejection passed. Later attempts
+  encountered transport/non-JSON responses; a complete external-server matrix is
+  not claimed.
+- These automated fixtures do not establish physical camera or human biometric
+  assurance. Their test PAM module is never packaged or installed on a user host.
