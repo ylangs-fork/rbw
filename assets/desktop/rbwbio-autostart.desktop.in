@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rbwBio
+Comment=Keep the rbwBio request inbox and desktop notifications available
+Exec=@RBW_EXEC@ ui --background
+Icon=rbwbio
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-rbwBio-Managed=true

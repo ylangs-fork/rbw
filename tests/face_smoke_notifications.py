@@ -21,7 +21,7 @@ class Notifications(dbus.service.Object):
 
     @dbus.service.method("org.freedesktop.Notifications", in_signature="", out_signature="as")
     def GetCapabilities(self):
-        return ["body"]
+        return ["body", "actions", "icon-static"]
 
     @dbus.service.method("org.freedesktop.Notifications", in_signature="", out_signature="ssss")
     def GetServerInformation(self):
@@ -37,12 +37,20 @@ class Notifications(dbus.service.Object):
             )
         self.sequence += 1
         with open("/run/face-smoke/notifications", "a", encoding="utf8") as receipt:
-            receipt.write(json.dumps({"summary": str(summary), "body": str(body)}) + "\n")
+            receipt.write(json.dumps({"id": self.sequence, "summary": str(summary), "body": str(body), "actions": list(map(str, actions))}) + "\n")
         return self.sequence
 
     @dbus.service.method("org.freedesktop.Notifications", in_signature="u", out_signature="")
     def CloseNotification(self, notification_id):
-        pass
+        self.NotificationClosed(notification_id, 3)
+
+    @dbus.service.signal("org.freedesktop.Notifications", signature="uu")
+    def NotificationClosed(self, notification_id, reason):
+        return None
+
+    @dbus.service.signal("org.freedesktop.Notifications", signature="us")
+    def ActionInvoked(self, notification_id, action):
+        return None
 
 
 service = Notifications()

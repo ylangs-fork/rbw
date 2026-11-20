@@ -213,6 +213,7 @@ pub enum Action {
     Login,
     Register,
     ReloadSessionConfig,
+    Ui,
     Unlock,
     UnlockWithUserKey {
         key: UserKeyMaterial,
@@ -307,6 +308,7 @@ impl Drop for UserKeyMaterial {
 #[serde(tag = "type")]
 pub enum Response {
     Ack,
+    Ui { url: String },
     DeviceAuthPending { id: String, fingerprint: String },
     AuthRequests { requests: Vec<AuthRequestInfo> },
     AuthRequestApproval { request: AuthRequestInfo },

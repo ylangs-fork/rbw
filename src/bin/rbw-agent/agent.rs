@@ -196,6 +196,10 @@ async fn handle_request(
         rbw::protocol::Action::RejectAuthRequest { id } => {
             crate::actions::reject_auth_request(sock, id).await?;
         }
+        rbw::protocol::Action::Ui => {
+            let hub = crate::request_ui::start(state.clone(), &environment).await?;
+            sock.send(&rbw::protocol::Response::Ui { url: hub.url().to_string() }).await?;
+        }
         rbw::protocol::Action::CheckLock => {
             crate::actions::check_lock(sock, state.clone()).await?;
         }
@@ -325,7 +329,7 @@ pub async fn gate_sensitive_action(
                 "agent locked during local authentication"
             ));
         }
-        result = gate.authorize() => result?,
+        result = crate::request_ui::authorize_local(state.clone(), environment, gate, "Vault access authorization") => result?,
     }
 
     let mut state = state.lock().await;

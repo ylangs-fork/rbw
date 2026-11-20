@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light dark">
+  <title>rbwBio · Requests</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body data-view="list">
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>rbwBio Requests</h1>
+          <p id="identity" class="muted">Connecting to the local agent…</p>
+        </div>
+      </div>
+      <div class="top-tools">
+        <ul class="pills" aria-label="Agent status">
+          <li id="pill-vault" class="pill" data-tone="idle">Vault: —</li>
+          <li id="pill-remote" class="pill" data-tone="idle">Device approval: —</li>
+          <li id="pill-link" class="pill" data-tone="idle">Agent: connecting</li>
+        </ul>
+        <button id="refresh" type="button" class="btn">Refresh</button>
+      </div>
+    </header>
+
+    <div class="banners">
+      <div id="banner-link" class="notice" data-tone="bad" role="alert" hidden>
+        <div><strong id="banner-link-title"></strong><p id="banner-link-text"></p></div>
+      </div>
+      <div id="banner-locked" class="notice" data-tone="warn" hidden>
+        <div>
+          <strong>Vault locked</strong>
+          <p>Unlock the vault before approving a device. Unlock opens the native pinentry dialog; your master password never passes through this page.</p>
+        </div>
+        <button id="unlock" type="button" class="btn btn-primary">Unlock…</button>
+      </div>
+      <div id="banner-remote" class="notice" data-tone="warn" hidden>
+        <div><strong id="banner-remote-title"></strong><p id="banner-remote-text"></p></div>
+      </div>
+      <div id="banner-global" class="notice" data-tone="bad" role="alert" hidden>
+        <div><strong>Operation not completed</strong><p id="banner-global-text"></p></div>
+        <button id="banner-global-close" type="button" class="btn btn-quiet">Dismiss</button>
+      </div>
+    </div>
+
+    <div class="layout">
+      <nav class="inbox" aria-label="Request list">
+        <section aria-labelledby="pending-title">
+          <h2 id="pending-title" class="section-title">Pending <span id="pending-count" class="count">0</span></h2>
+          <ul id="pending" class="rows"></ul>
+          <p id="pending-empty" class="empty">Connecting to the agent…</p>
+        </section>
+        <section aria-labelledby="history-title">
+          <h2 id="history-title" class="section-title">History <span id="history-count" class="count">0</span></h2>
+          <ul id="history" class="rows"></ul>
+          <p id="history-empty" class="empty" hidden>No completed requests yet.</p>
+        </section>
+      </nav>
+
+      <section class="detail" aria-label="Request details">
+        <div id="detail-idle" class="detail-empty">
+          <h2>Select a request</h2>
+          <p id="detail-idle-text">Select a request from the list to see its details. Viewing or selecting a request never approves it.</p>
+        </div>
+
+        <div id="detail-missing" class="detail-empty" hidden>
+          <button id="missing-back" type="button" class="btn btn-quiet back">‹ Back to list</button>
+          <h2 id="missing-title" tabindex="-1">Request not found</h2>
+          <p>The agent has no record of this request. It may have expired and been removed, or may not have synced yet. Select Refresh to check again.</p>
+        </div>
+
+        <article id="record" hidden>
+          <button id="back" type="button" class="btn btn-quiet back">‹ Back to list</button>
+          <header class="record-head">
+            <div>
+              <p id="record-kind" class="eyebrow"></p>
+              <h2 id="record-title" tabindex="-1"></h2>
+            </div>
+            <span id="record-status" class="badge"></span>
+          </header>
+          <p id="record-lead" class="lead"></p>
+
+          <div id="record-error" class="notice" data-tone="bad" role="alert" hidden>
+            <div><strong>Operation not completed</strong><p id="record-error-text"></p></div>
+            <button id="record-error-close" type="button" class="btn btn-quiet">Dismiss</button>
+          </div>
+
+          <section id="fp-panel" class="fingerprint" aria-labelledby="fp-label" hidden>
+            <p id="fp-label" class="eyebrow">Device fingerprint (five hyphen-separated words)</p>
+            <p id="fp-value" class="fp" lang="en"></p>
+            <p class="muted">Find the fingerprint on the requesting device and compare every word before approving. If it differs, reject this request.</p>
+          </section>
+
+          <dl id="record-meta" class="meta"></dl>
+          <p id="record-message" class="backend-message" hidden></p>
+          <div id="retry-row" class="retry" hidden>
+            <button id="record-refresh" type="button" class="btn">Recheck requests</button>
+            <p class="muted">Rechecking only fetches requests again. It never approves a request or starts face verification. A request still pending on the server will reappear for review.</p>
+          </div>
+
+          <section id="camera-panel" class="camera" aria-labelledby="camera-title" hidden>
+            <h3 id="camera-title" class="section-title">RGB camera preview</h3>
+            <div class="view">
+              <video id="camera" autoplay playsinline muted hidden aria-label="Live camera preview (mirrored)"></video>
+              <p id="camera-note">Requesting camera permission…</p>
+              <span id="camera-tag" class="tag" hidden>Local preview only · No recording · No upload</span>
+            </div>
+            <p id="camera-label" class="muted" hidden></p>
+            <div id="camera-issue" class="notice" data-tone="warn" role="status" hidden>
+              <div><strong id="camera-issue-title"></strong><p id="camera-issue-text"></p></div>
+              <button id="camera-retry" type="button" class="btn">Retry camera</button>
+            </div>
+            <p class="muted">The RGB preview stays in this tab and only helps you face the camera. It cannot approve anything. Local PAM performs face recognition using the infrared camera.</p>
+          </section>
+
+          <section id="actions" class="actions" aria-label="Actions" hidden>
+            <label id="review-row" class="check" hidden>
+              <input id="review" type="checkbox">
+              <span>I compared every fingerprint word with the requesting device. They match exactly.</span>
+            </label>
+            <div class="action-row">
+              <button id="approve" type="button" class="btn btn-primary" aria-describedby="action-hint" hidden>Approve and verify face</button>
+              <button id="reject" type="button" class="btn btn-danger" hidden>Reject</button>
+              <button id="cancel" type="button" class="btn" hidden>Cancel request</button>
+            </div>
+            <p id="action-hint" class="muted"></p>
+          </section>
+        </article>
+      </section>
+    </div>
+
+    <footer class="foot">
+      <span id="foot-tray" class="muted"></span>
+      <span id="foot-sync" class="muted"></span>
+    </footer>
+  </div>
+  <p id="announce" class="sr-only" role="status" aria-live="polite"></p>
+  <noscript><p class="noscript">Enable JavaScript to display requests.</p></noscript>
+</body>
+</html>

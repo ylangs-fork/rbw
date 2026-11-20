@@ -2304,6 +2304,29 @@ pub(crate) fn reload_session_config() -> anyhow::Result<()> {
     crate::actions::reload_session_config()
 }
 
+pub fn ui(background: bool) -> anyhow::Result<()> {
+    if check_agent_version().is_err() {
+        run_agent()?;
+        check_agent_version()?;
+    }
+    let url = crate::actions::ui_url()?;
+    if !background {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(rbw::desktop::open_url(
+                &crate::actions::get_environment(),
+                &url,
+            ))?;
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            open::that(&url).context("desktop browser did not open")?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_agent() -> anyhow::Result<()> {
     check_config()?;
     if matches!(check_agent_version(), Ok(())) {

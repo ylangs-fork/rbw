@@ -25,8 +25,9 @@ features while retaining the existing command and data interfaces.
 
 ## Installation
 
-Install **rbwBio** from the Homebrew tap below, or build this repository.
-The distribution packages listed here are upstream `rbw`, not rbwBio.
+Install **rbwBio** from its Homebrew tap, its commit-pinned Ubuntu desktop
+packages, or build this repository. Other distribution links below provide
+upstream `rbw`, not rbwBio.
 
 ### Arch Linux
 
@@ -38,15 +39,21 @@ will always build from the latest master commit.
 
 ### Debian/Ubuntu
 
-`rbw` is officially packaged for Debian as
-[`rust-rbw`](https://tracker.debian.org/pkg/rust-rbw) and is available in
-testing (forky). You can install it using `sudo apt install rbw`.
+For rbwBio on Ubuntu 22.04/24.04 amd64, download the `.deb`, `SHA256SUMS` and
+provenance bundle from a `desktop-*` release in
+[ylangs-fork/rbw](https://github.com/ylangs-fork/rbw/releases).
+Verify the checksums and GitHub build provenance, then install the local package:
 
-Alternatively, you can download a Debian package from
-[https://git.tozt.net/rbw/releases/deb/
-](https://git.tozt.net/rbw/releases/deb/). The packages are signed by
-[`minisign`](https://github.com/jedisct1/minisign), and can be verified using
-the public key `RWTM0AZ5RpROOfAIWx1HvYQ6pw1+FKwN6526UFTKNImP/Hz3ynCFst3r`.
+```sh
+sudo apt install ./rbwbio_*.deb
+rbw login
+```
+
+The package contains the CLI, agent, standard desktop icons/entrypoints and the
+pinned precompiled face runtime. Installation does not enroll a face, activate PAM,
+download a face runtime or compile code. Normal apt dependency installation is
+separate from the offline opt-in deployment. Do not install alongside upstream
+`rbw`, which supplies the same commands. Config, vault and face models are preserved.
 
 ### Fedora/EPEL
 
@@ -283,6 +290,28 @@ order to use `rbw` with the official Bitwarden server, you will need to first
 run `rbw register` to register each device using `rbw` with the Bitwarden
 server. This will prompt you for your personal API key which you can find using
 the instructions [here](https://bitwarden.com/help/article/personal-api-key/).
+
+### Desktop request dashboard
+
+On GNU/Linux, open **rbwBio** from the application menu, click its optional tray
+icon, or run `rbw ui`. Desktop autostart uses `rbw ui --background`. Standard
+freedesktop notification actions open the exact request; GNOME does not need a
+tray extension. Missing tray support does not disable authorization.
+
+The loopback-only dashboard shows local authorization and remote device requests
+separately. All software text is English; user-provided names remain unchanged.
+RGB video is positioning-only, browser-local, never recorded or uploaded.
+Native PAM and the IR camera remain the biometric authority. Camera permission
+is required for preview, not for the PAM decision. Leaving a request releases
+preview capture; cancelling an active authorization returns failure.
+
+For remote requests, compare all five fingerprint words with the requesting
+device, confirm the checkbox, then choose **Approve and verify face**. Opening
+the dashboard or a notification never approves a request. Approval is complete
+only after the server accepts it. **Reject** requires no face check. Cancelling
+stops local waiting but cannot revoke approval already accepted by the server.
+The approving vault must first be unlocked through native pinentry or `rbw unlock`;
+no master password or vault key passes through the page.
 
 ### Login with device
 

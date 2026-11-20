@@ -4,8 +4,8 @@ pub use rbw::pam_gate::{helper_requested, run_helper};
 
 /// Authorize release of a User Key for a specific device-login request.
 ///
-/// Device-auth metadata remains validated here; all PAM mechanics live in the
-/// reusable library-level `pam_gate` module.
+/// Device-auth metadata remains validated here; the observable request UI owns
+/// the native PAM gate and its lifecycle.
 pub async fn authorize(
     environment: &rbw::protocol::Environment,
     request_id: &str,
@@ -14,16 +14,7 @@ pub async fn authorize(
     validate_approval_context(request_id, fingerprint).map_err(|_| {
         anyhow::anyhow!("local system authentication is unavailable")
     })?;
-    let description = format!(
-        "Approve device login request {request_id} with fingerprint {fingerprint}"
-    );
-    rbw::pam_gate::PamGate::new()?
-        .with_context(
-            environment.clone(),
-            "Approve device login",
-            description,
-        )?
-        .authorize()
+    crate::request_ui::authorize_device(environment, request_id, fingerprint)
         .await
 }
 

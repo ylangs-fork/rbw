@@ -5,6 +5,8 @@ pub mod cipherstring;
 pub mod config;
 pub mod db;
 pub mod device_auth;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub mod desktop;
 pub mod dirs;
 pub mod edit;
 pub mod error;

@@ -31,9 +31,14 @@ pub(super) async fn authorize(
     environment: &Environment,
     title: &str,
     description: &str,
+    request_link: Option<&str>,
 ) -> anyhow::Result<()> {
     let body = authorization_body(title, description);
-    send(environment, AUTHORIZATION_TITLE, &body).await
+    if let Some(url) = request_link {
+        crate::desktop::notify_request(environment, AUTHORIZATION_TITLE, &body, url).await
+    } else {
+        send(environment, AUTHORIZATION_TITLE, &body).await
+    }
 }
 
 fn authorization_body(title: &str, description: &str) -> String {
@@ -74,7 +79,7 @@ fn safe_fingerprint(value: &str) -> bool {
     count == 5
 }
 
-fn session_bus(
+pub(super) fn session_bus(
     environment: &Environment,
 ) -> anyhow::Result<std::ffi::OsString> {
     let variables = environment.env_vars();
