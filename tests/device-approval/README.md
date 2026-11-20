@@ -45,7 +45,7 @@ The server's data directory is its own tmpfs. No ports are published, no Docker
 socket/home/config/PAM/device is mounted, and no privileged container is needed.
 Only a fresh private artifact directory is bind-mounted for cleanup recovery.
 Images must already be available or pullable; Docker setup commands have finite
-120-second deadlines. The complete attached acceptance run has a 420-second
+120-second deadlines. The complete attached acceptance run has a 600-second
 deadline, with a separate bounded graceful-cleanup window.
 
 ## Deliberate external-server mode
@@ -117,11 +117,19 @@ email is `rbwbio-device-<fresh UUID>@example.invalid`.
 10. Check the HTTP DTO allowlist and captured diagnostics for generated plaintext
    password/secret/User Key/token material. No secret/request access code is
    printed; normal stdout contains English phase markers and safe UUID or
-   fingerprint metadata only. All CLI output and HTTP bodies stay captured.
+    fingerprint metadata only. Failure-only CLI diagnostics are checked against
+    generated private material before output; HTTP response bodies otherwise stay captured.
 11. Stop only these two profiles and delete only this run's synthetic account
     through authenticated `POST /api/accounts/delete`, after checking the normal
     authenticated profile email/UUID. Require its token to stop authenticating.
     Remove this run's containers/network/private temporary data.
+
+Vaultwarden 1.35.0 retains approved auth requests until its normal five-minute
+purge. Before deleting the account, the harness waits up to 400 seconds for its
+own recorded request IDs to disappear through authenticated GETs. This avoids
+deleting a user while dependent requests still exist; no cron override, SQL
+cleanup, server patch or administrator endpoint is used. Private recovery records
+retain those IDs and the same bounded expiry wait.
 
 HTTP calls have 8-second timeouts; CLI commands 20 seconds (5 for stopping);
 readiness/discovery has bounded polling; requester completion has 25 seconds.

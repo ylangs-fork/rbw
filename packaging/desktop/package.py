@@ -147,7 +147,7 @@ def package():
             raise RuntimeError('dpkg-shlibdeps did not report dependency metadata')
         dependencies = [value.strip() for value in shlibs.strip().split('=', 1)[1].split(',')]
         dependencies = [value for value in dependencies if not re.match(r'^libc6(?:\s|$)', value)]
-        dependencies += ['libc6 (>= 2.35)', 'libpam0g', 'xdg-utils',
+        dependencies += ['libc6 (>= 2.35)', 'libpam0g', 'xdg-utils', 'librsvg2-common',
                          'pinentry-gnome3 | pinentry-qt | pinentry-x11']
         dependencies = list(dict.fromkeys(dependencies))
         installed_size = sum(path.stat().st_size for path in root.rglob('*') if path.is_file())

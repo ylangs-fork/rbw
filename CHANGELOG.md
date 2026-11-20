@@ -22,6 +22,12 @@
   integration without opening a browser. Missing tray support is non-fatal.
 * `rbw-agent --help` and `--version` exit without starting the daemon.
 
+### Fixed
+
+* Keep rejection separate from face authentication so rejecting a remote request
+  never triggers a camera permission prompt.
+* Include the native SVG icon loader in Ubuntu desktop dependencies.
+
 ## [1.17.5] - 2026-11-19
 
 ### Fixed

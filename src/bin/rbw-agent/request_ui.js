@@ -39,7 +39,7 @@ const POLL_MS = 1000;
 const POLL_HIDDEN_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 5000;
 const POLL_TIMEOUT_MS = 6000;
-const LIVE = new Set(['pending_review', 'authenticating']);
+const LIVE = new Set(['pending_review', 'authenticating', 'rejecting']);
 
 const KIND_LABEL = {local: 'Local', device: 'Remote'};
 const STATUS = {
@@ -55,6 +55,7 @@ const STATUS = {
   device: {
     pending_review: ['Review fingerprint', 'warn'],
     authenticating: ['Verifying and submitting', 'info'],
+    rejecting: ['Submitting rejection', 'info'],
     approved: ['Approved', 'ok'],
     rejected: ['Rejected', 'idle'],
     failed: ['Failed', 'bad'],
@@ -605,6 +606,7 @@ function leadFor(record) {
   if (s === 'authenticating') {
     return 'You confirmed approval. Local face verification and server submission are in progress. Approval completes only when the server accepts it; face verification alone is not completion.';
   }
+  if (s === 'rejecting') return 'Submitting your rejection to the server. Face verification and camera preview are not required.';
   if (s === 'approved') return 'The server accepted this approval. The requesting device can now finish signing in.';
   if (s === 'rejected') return 'This device login request was rejected.';
   if (s === 'cancelled') return 'Approval was cancelled locally. An approval already accepted by the server cannot be revoked here. Refresh to confirm its status.';

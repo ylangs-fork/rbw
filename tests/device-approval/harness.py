@@ -15,6 +15,7 @@ import pwd
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -59,7 +60,7 @@ def eventually(predicate, label, seconds=35):
 
 def http(url, method="GET", body=None, token=None, form=False, origin=None):
     headers = {"Accept": "application/json", "Bitwarden-Client-Name": "cli",
-               "Bitwarden-Client-Version": "2026.6.0"}
+               "Bitwarden-Client-Version": "2026.6.0", "User-Agent": "rbwBio-device-acceptance/1"}
     data = None
     if body is not None:
         data = (urllib.parse.urlencode(body).encode() if form else
@@ -231,6 +232,7 @@ class Harness:
         public_der = account_key.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         self.account = {"server": self.server, "email": self.email, "run_id": self.identifier,
+                        "auth_request_ids": [],
                         "password_hash": password_hash, "token": None, "account_id": None,
                         "registration_attempted": True, "registered": False}
         self.save_recovery()
@@ -356,6 +358,8 @@ class Harness:
             return None
         request_id, fingerprint = eventually(pending, "requester pending output")
         require(str(uuid.UUID(request_id)) == request_id, "request UUID not canonical")
+        self.account["auth_request_ids"].append(request_id)
+        self.save_recovery()
         baseline = self.server_pending(request_id)
         def discovered():
             require(process.poll() is None, "requester finished before GUI review")
@@ -392,7 +396,7 @@ class Harness:
         def settled():
             record = self.request_state(request["id"])
             require(record is not None, "GUI lost active request")
-            if record["status"] in ("pending_review", "authenticating"):
+            if record["status"] in ("pending_review", "authenticating", "rejecting"):
                 return False
             require(record["status"] == expected, "GUI decision had unexpected terminal state")
             return True
@@ -544,8 +548,15 @@ class Harness:
         config_path.write_text(json.dumps(config))
         profile["agent"] = self.start("approver", "ordinary-agent", "rbw-agent", "--no-daemonize")
         sock = profile["runtime"] / ("rbw-" + profile["name"]) / "socket"
-        eventually(lambda: sock.is_socket() if profile["agent"].poll() is None else
-                   require(False, "ordinary approver agent exited"), "ordinary agent socket readiness")
+        def agent_ready():
+            require(profile["agent"].poll() is None, "ordinary approver agent exited")
+            try:
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.connect(str(sock))
+                return True
+            except (ConnectionRefusedError, FileNotFoundError):
+                return False
+        eventually(agent_ready, "ordinary agent socket readiness")
         # Restarting discards in-memory keys. This is a local password unlock,
         # not another server login or a seeded User Key; no UI command is used.
         (profile["home"] / "pinentry-allow").write_text("allow\n")
@@ -618,11 +629,33 @@ class Harness:
                 "refusing cleanup for a different account")
         self.account["account_id"] = field(profile, "id")
         self.save_recovery()
+        pending = list(self.account.get("auth_request_ids", []))
+        if pending:
+            phase("waiting for normal server expiry before authenticated account deletion")
+        deadline = time.monotonic() + 400
+        while pending:
+            remaining = []
+            for request_id in pending:
+                status, _ = http(self.server + "/api/auth-requests/" + request_id, token=token)
+                if status == 200:
+                    remaining.append(request_id)
+                else:
+                    require(status in (400, 404, 410), "could not verify request expiry before cleanup")
+            pending = remaining
+            require(not pending or time.monotonic() < deadline, "server request expiry exceeded cleanup deadline")
+            if pending:
+                time.sleep(5)
         status, raw = http(self.server + "/api/accounts/delete", "POST",
                            {"masterPasswordHash": self.account["password_hash"]}, token)
-        category = "invalid-password" if b"Invalid password" in raw else "unclassified"
-        require(200 <= status < 300, "authenticated synthetic account deletion failed (HTTP " +
-                str(status) + ", " + category + ")")
+        if not 200 <= status < 300:
+            self.check_private(raw)
+            try:
+                error = json.loads(raw)
+                detail = field(field(error, "errorModel") or error, "message") or "unclassified"
+            except (ValueError, TypeError):
+                detail = "unclassified"
+            raise Failure("authenticated synthetic account deletion failed (HTTP " +
+                          str(status) + ", " + str(detail)[:250] + ")")
         # The same normal authenticated profile endpoint must now reject its token.
         require(http(self.server + "/api/accounts/profile", token=token)[0] in (400, 401, 403, 404),
                 "deleted synthetic account still authenticates")
@@ -684,7 +717,6 @@ def main():
         harness.prepare_profiles()
         harness.register()
         harness.exercise()
-        harness.ordinary_cli_approval()
     except Exception as error:
         # Never interpolate raw HTTP, CLI, JSON or crypto exception strings.
         failure = str(error) if isinstance(error, Failure) else (

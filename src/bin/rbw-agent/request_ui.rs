@@ -27,7 +27,7 @@ struct UiRequest {
     cancel: watch::Sender<bool>,
 }
 impl UiRequest {
-    fn live(&self) -> bool { matches!(self.status, "pending_review" | "authenticating") }
+    fn live(&self) -> bool { matches!(self.status, "pending_review" | "authenticating" | "rejecting") }
 }
 struct Inbox {
     requests: Vec<UiRequest>,
@@ -344,6 +344,7 @@ async fn decide(State(hub): State<Arc<Hub>>, Path((kind,id,action)): Path<(Strin
         let request = inbox.requests.iter_mut().find(|r| r.kind == kind && r.id == id).ok_or_else(|| api_error(StatusCode::NOT_FOUND,"The request does not exist or its record expired."))?;
         if !request.live() { return Err(api_error(StatusCode::CONFLICT,"The request has ended. Refresh its status.")); }
         match action.as_str() {
+            "cancel" if request.status == "rejecting" => return Err(api_error(StatusCode::CONFLICT,"Rejection is already being submitted. Refresh its status.")),
             "cancel" => { request.cancel.send_replace(true); request.status="cancelled"; request.finished_at=Some(now()); request.message=Some(if kind == "device" { "Local waiting stopped. An approval already accepted by the server cannot be revoked here." } else { "This authorization was cancelled." }.into()); return Ok(ok()); }
             "approve" if kind == "device" => {
                 if request.status != "pending_review" { return Err(api_error(StatusCode::CONFLICT,"The request is already being processed.")); }
@@ -352,7 +353,7 @@ async fn decide(State(hub): State<Arc<Hub>>, Path((kind,id,action)): Path<(Strin
             }
             "reject" if kind == "device" => {
                 if request.status != "pending_review" { return Err(api_error(StatusCode::CONFLICT,"Cancel the active authentication first.")); }
-                request.status="authenticating"; request.message=Some("Submitting rejection.".into());
+                request.status="rejecting"; request.message=Some("Submitting rejection.".into());
             }
             _ => return Err(api_error(StatusCode::BAD_REQUEST,"Unsupported request action.")),
         }

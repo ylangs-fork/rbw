@@ -76,7 +76,10 @@ def main():
         browser = json.load(response)
     if not browser.get("webSocketDebuggerUrl") or not browser.get("Browser"):
         raise RuntimeError("The real browser CDP endpoint is incomplete")
-    app = Gio.DesktopAppInfo.new("rbwbio.desktop")
+    try:
+        app = Gio.DesktopAppInfo.new("rbwbio.desktop")
+    except TypeError:
+        app = None
     if args.require_app and app is None:
         raise RuntimeError("The installed native rbwbio.desktop launcher is missing")
     print(json.dumps({

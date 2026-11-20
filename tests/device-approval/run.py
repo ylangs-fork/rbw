@@ -18,6 +18,7 @@ import shlex
 import sys
 import tempfile
 import urllib.error
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -66,7 +67,8 @@ def cleanup_manifest(path):
     server = server_url(account["server"])
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     def request(route, body=None, token=None, form=False):
-        headers = {"Bitwarden-Client-Name": "cli", "Bitwarden-Client-Version": "2026.6.0"}
+        headers = {"Bitwarden-Client-Name": "cli", "Bitwarden-Client-Version": "2026.6.0",
+                   "User-Agent": "rbwBio-device-acceptance/1"}
         data = None
         if body is not None:
             data = (urllib.parse.urlencode(body).encode() if form else json.dumps(body).encode())
@@ -100,6 +102,23 @@ def cleanup_manifest(path):
             (not account.get("account_id") or account_id == account["account_id"]),
             "refusing cleanup for a different profile")
     require(str(uuid.UUID(account_id)) == account_id, "cleanup profile UUID invalid")
+    pending = account.get("auth_request_ids", [])
+    require(isinstance(pending, list) and all(isinstance(value, str) and
+            str(uuid.UUID(value)) == value for value in pending), "invalid cleanup request IDs")
+    deadline = time.monotonic() + 400
+    while pending:
+        remaining = []
+        for request_id in pending:
+            status, _ = request("/api/auth-requests/" + request_id, token=token)
+            if status == 200:
+                remaining.append(request_id)
+            else:
+                require(status in (400, 404, 410), "cleanup cannot verify normal request expiry")
+        pending = remaining
+        require(not pending or time.monotonic() < deadline,
+                "normal request expiry exceeded cleanup deadline; recovery file retained")
+        if pending:
+            time.sleep(5)
     status, _ = request("/api/accounts/delete", {"masterPasswordHash": account["password_hash"]}, token)
     require(200 <= status < 300, "authenticated account deletion failed; recovery file retained")
     require(request("/api/accounts/profile", token=token)[0] in (400, 401, 403, 404),
@@ -168,9 +187,9 @@ def main():
         # The driver prints only safe phases/UUID/fingerprint metadata, not CLI/server output.
         attached = subprocess.Popen(["docker", "start", "--attach", runner_name], stdin=subprocess.DEVNULL)
         try:
-            outcome = attached.wait(timeout=420)
+            outcome = attached.wait(timeout=600)
         except subprocess.TimeoutExpired:
-            raise Failure("full protocol acceptance exceeded 420 seconds") from None
+            raise Failure("full protocol acceptance exceeded 600 seconds") from None
     finally:
         # Graceful TERM gives Python a chance to delete the synthetic account.
         # No globally named service, host profile, PAM file or unrelated container is touched.
