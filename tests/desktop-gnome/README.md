@@ -11,15 +11,13 @@ a full systemd/login-manager installation. The image removes apt's empty
 This exercises Shell launch/search and notifications; it does not establish
 login-session, hardware or human-PAM assurance.
 
-No application binary is built here. The parent supplies the actual installed
-package and an architecture-matching, precompiled Chrome/Chromium directory. There
-is no Ubuntu `chromium-browser` snap dependency. The base is an official Ubuntu
-24.04 multi-platform digest; the packaging smoke image's Ubuntu 22.04 digest cannot
-provide the requested 24.04 GNOME environment. Distro packages are resolved at
-build time, so record the resulting image ID and package manifest with evidence.
-No validation has been executed by the author of this fixture.
+No application binary is built here. The parent supplies an isolated Homebrew
+installation of rbwBio and an architecture-matching, precompiled Chrome/Chromium
+directory. There is no Ubuntu `chromium-browser` snap dependency. The base is an
+official Ubuntu 24.04 multi-platform digest. Distro packages are resolved at build
+time, so record the resulting image ID and package manifest with evidence.
 
-## Build and install the parent's package
+## Build and install through Homebrew
 
 From the repository root:
 
@@ -28,28 +26,25 @@ docker buildx build --load --progress=plain \
   -t rbwbio-gnome-fixture tests/desktop-gnome
 ```
 
-Install the parent's real `.deb` into a derived disposable image **before** the
-session starts. The package is supplied separately; no production/packaging source
-is changed by this fixture. For example, with an otherwise empty directory
-`$PACKAGE_DIRECTORY` containing the parent's `rbwbio.deb`:
+Install Homebrew in a derived disposable image using its
+[official Linux instructions](https://docs.brew.sh/Homebrew-on-Linux), then run
+the normal package installation as the non-root Homebrew owner before starting
+the session:
 
 ```sh
-docker buildx build --load --progress=plain -t rbwbio-gnome-app \
-  -f - "$PACKAGE_DIRECTORY" <<'DOCKERFILE'
-# syntax=docker/dockerfile:1.7-labs
-FROM rbwbio-gnome-fixture
-COPY rbwbio.deb /tmp/rbwbio.deb
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends /tmp/rbwbio.deb \
-    && rm /tmp/rbwbio.deb
-DOCKERFILE
+brew install --force-bottle ylang-ylang/tap/rbwbio
+brew info --json=v2 ylang-ylang/tap/rbwbio
 ```
 
-If the parent instead deploys binaries, it must also deploy the *actual* desktop
-entry and icons at their intended XDG locations. Do not replace the launcher with
-a test URL or fixture script. Verify package installation and policy separately;
-this environment does not edit `/etc/pam.d` or provide an authorization mock.
+Retain the installation receipt and confirm `poured_from_bottle=true`.
+The complete Homebrew prefix and its installed dependencies must remain at their
+original paths in the image. Give the desktop user read/execute access and include
+`/home/linuxbrew/.linuxbrew/bin` in `PATH` and
+`/home/linuxbrew/.linuxbrew/share` in `XDG_DATA_DIRS`, alongside the system defaults.
+Use the real desktop entry and icons installed by the formula; do not replace the
+launcher with a test URL or fixture script. Tag the resulting image
+`rbwbio-gnome-app`. This fixture does not edit `/etc/pam.d` or provide an
+authorization mock.
 
 ## Start and wait for actual readiness
 

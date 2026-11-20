@@ -25,42 +25,8 @@ features while retaining the existing command and data interfaces.
 
 ## Installation
 
-Install **rbwBio** from its Homebrew tap, its commit-pinned Ubuntu desktop
-packages, or build this repository. Other distribution links below provide
-upstream `rbw`, not rbwBio.
-
-### Arch Linux
-
-`rbw` is available in the [extra
-repository](https://archlinux.org/packages/extra/x86_64/rbw/).
-Alternatively, you can install
-[`rbw-git`](https://aur.archlinux.org/packages/rbw-git/) from the AUR, which
-will always build from the latest master commit.
-
-### Debian/Ubuntu
-
-For rbwBio on Ubuntu 22.04/24.04 amd64, download the `.deb`, `SHA256SUMS` and
-provenance bundle from a `desktop-*` release in
-[ylangs-fork/rbw](https://github.com/ylangs-fork/rbw/releases).
-Verify the checksums and GitHub build provenance, then install the local package:
-
-```sh
-sudo apt install ./rbwbio_*.deb
-rbw login
-```
-
-The package contains the CLI, agent, standard desktop icons/entrypoints and the
-pinned precompiled face runtime. Installation does not enroll a face, activate PAM,
-download a face runtime or compile code. Normal apt dependency installation is
-separate from the offline opt-in deployment. Do not install alongside upstream
-`rbw`, which supplies the same commands. Config, vault and face models are preserved.
-
-### Fedora/EPEL
-
-`rbw` is available in [Fedora and EPEL 9](https://bodhi.fedoraproject.org/updates/?packages=rust-rbw)
-(for RHEL and compatible distributions).
-
-You can install it using `sudo dnf install rbw`.
+Homebrew is the only supported installation method for **rbwBio**, including on
+Ubuntu Desktop. Install from this fork's tap, not an upstream `rbw` package.
 
 ### Homebrew
 
@@ -80,27 +46,6 @@ you opt in; see "Face enrollment" below. macOS supports requester/remote use,
 not local Howdy enrollment. Homebrew uses a precompiled bottle when one is
 available for your platform; otherwise it builds rbwBio from source.
 
-### Nix
-
-`rbw` is available in the
-[NixOS repository](https://search.nixos.org/packages?show=rbw). You can try
-it out via `nix-shell -p rbw`.
-
-### Alpine
-
-`rbw` is available in the [community repository](https://pkgs.alpinelinux.org/packages?name=rbw). You can install it with `apk add rbw`.
-
-### Other
-
-With a working Rust installation, build rbwBio from this repository with
-`cargo install --locked --path .`, or use
-`cargo install --locked --git https://github.com/ylangs-fork/rbw`.
-The crate name remains `rbw`. This requires that the
-[`pinentry`](https://www.gnupg.org/related_software/pinentry/index.en.html)
-program is installed (to display password prompts). On GNU/Linux, PAM-backed
-local approval also requires PAM development files when building from source
-(`libpam0g-dev` on Debian/Ubuntu, or the distribution equivalent) and the
-chosen PAM modules at runtime.
 
 ## Configuration
 
@@ -342,8 +287,8 @@ or logs.
 
 PAM is linked only in GNU/Linux builds. The portable musl release remains able
 to request a device unlock, but fails closed if asked to approve locally; use a
-GNU/Linux source build or Debian package for the approver. macOS and Android
-builds likewise keep requester support without PAM approval.
+GNU/Linux Homebrew bottle for the approver. macOS and Android builds likewise
+keep requester support without PAM approval.
 
 Then compare the fingerprint shown on both devices before approving:
 
