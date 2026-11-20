@@ -26,6 +26,12 @@ struct FindArgs {
     about = "rbwBio: unofficial Bitwarden CLI with opt-in face authorization"
 )]
 enum Opt {
+    #[command(about = "Open the rbwBio desktop request panel")]
+    Ui {
+        #[arg(long, help = "Start the desktop inbox and tray without opening a browser")]
+        background: bool,
+    },
+
     #[command(
         about = "Check or configure face authorization for rbwBio",
         long_about = "Check rbwBio's isolated Linux face-authentication policy without \
@@ -284,6 +290,7 @@ impl Opt {
                 format!("config {}", config.subcommand_name())
             }
             Self::Setup { .. } => "setup".to_string(),
+            Self::Ui { .. } => "ui".to_string(),
             Self::Register => "register".to_string(),
             Self::Login => "login".to_string(),
             Self::Unlock { .. } => "unlock".to_string(),
@@ -408,6 +415,7 @@ fn main() {
     let subcommand_name = opt.subcommand_name();
     let res = match opt {
         Opt::Setup { check: _, apply } => setup::run(apply),
+        Opt::Ui { background } => commands::ui(background),
         Opt::Config { config } => match config {
             Config::Show => commands::config_show(),
             Config::Set { key, value } => commands::config_set(&key, &value),

@@ -92,6 +92,7 @@ pub struct PamGate {
     environment: crate::protocol::Environment,
     title: String,
     description: String,
+    request_link: Option<String>,
 }
 
 impl PamGate {
@@ -107,6 +108,7 @@ impl PamGate {
             environment: crate::protocol::Environment::default(),
             title: DEFAULT_TITLE.to_string(),
             description: DEFAULT_DESCRIPTION.to_string(),
+            request_link: None,
         })
     }
 
@@ -121,6 +123,21 @@ impl PamGate {
         self.title = title.into();
         self.description = description.into();
         validate_prompt(&self.title, &self.description)?;
+        Ok(self)
+    }
+
+    /// Attach an agent-created loopback observation page, never an approval.
+    pub fn with_request_link(mut self, url: String) -> anyhow::Result<Self> {
+        let parsed = url::Url::parse(&url)?;
+        anyhow::ensure!(
+            parsed.scheme() == "http"
+                && parsed.host_str() == Some("127.0.0.1")
+                && parsed.port().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "authorization observation URL is not local"
+        );
+        self.request_link = Some(url);
         Ok(self)
     }
 
@@ -148,6 +165,14 @@ pub async fn notification_preflight(
             "desktop face authorization requires GNU/Linux"
         ))
     }
+}
+
+/// Validate the user's local session bus using the same rules as PAM notices.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn desktop_session_bus(
+    environment: &crate::protocol::Environment,
+) -> anyhow::Result<std::ffi::OsString> {
+    notification::session_bus(environment)
 }
 
 pub fn helper_requested() -> bool {
@@ -301,8 +326,12 @@ async fn authorize_inner(gate: &PamGate) -> anyhow::Result<()> {
     // Start both together. Even a quick PAM rejection must finish its notice;
     // a failed notice cancels recognition immediately rather than authorizing
     // an unannounced request. Dropping either path retains group cleanup.
-    let notice =
-        notification::authorize(&environment, &gate.title, &gate.description);
+    let notice = notification::authorize(
+        &environment,
+        &gate.title,
+        &gate.description,
+        gate.request_link.as_deref(),
+    );
     tokio::pin!(notice, pam);
     tokio::select! {
         result = &mut notice => {

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=rbwBio
+GenericName=Bitwarden Request Inbox
+Comment=Review password access requests with native face authorization
+Exec=@RBW_EXEC@ ui
+Icon=rbwbio
+Terminal=false
+Categories=Utility;Security;
+Keywords=Bitwarden;password;face;biometric;
+StartupNotify=true
+X-rbwBio-Managed=true

@@ -303,6 +303,19 @@ pub fn version() -> anyhow::Result<u32> {
     }
 }
 
+pub fn ui_url() -> anyhow::Result<String> {
+    let mut sock = connect()?;
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::Ui,
+    ))?;
+    match sock.recv()? {
+        rbw::protocol::Response::Ui { url } => Ok(url),
+        rbw::protocol::Response::Error { error } => anyhow::bail!("{error}"),
+        _ => anyhow::bail!("unexpected desktop panel response"),
+    }
+}
+
 fn simple_action(action: rbw::protocol::Action) -> anyhow::Result<()> {
     let mut sock = connect()?;
 
@@ -339,7 +352,7 @@ fn wait_for_exit(pid: rustix::process::Pid) {
     }
 }
 
-fn get_environment() -> rbw::protocol::Environment {
+pub(crate) fn get_environment() -> rbw::protocol::Environment {
     let tty = std::env::var_os("RBW_TTY").or_else(|| {
         rustix::termios::ttyname(std::io::stdin(), vec![])
             .ok()

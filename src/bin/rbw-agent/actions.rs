@@ -383,15 +383,22 @@ async fn login_success(
     Ok(())
 }
 
+fn auth_request_fingerprint(
+    request: &rbw::api::AuthRequest,
+    email: &str,
+) -> anyhow::Result<String> {
+    validate_auth_request_id(&request.id)?;
+    let public_key = rbw::base64::decode(&request.public_key)
+        .context("auth request contained an invalid public key")?;
+    rbw::device_auth::fingerprint(email, &public_key)
+        .context("failed to calculate auth-request fingerprint")
+}
+
 fn auth_request_info(
     request: &rbw::api::AuthRequest,
     email: &str,
 ) -> anyhow::Result<rbw::protocol::AuthRequestInfo> {
-    validate_auth_request_id(&request.id)?;
-    let public_key = rbw::base64::decode(&request.public_key)
-        .context("auth request contained an invalid public key")?;
-    let fingerprint = rbw::device_auth::fingerprint(email, &public_key)
-        .context("failed to calculate auth-request fingerprint")?;
+    let fingerprint = auth_request_fingerprint(request, email)?;
     Ok(rbw::protocol::AuthRequestInfo {
         id: request.id.clone(),
         fingerprint,
@@ -819,9 +826,9 @@ pub async fn unlock_with_device(
     respond_ack(sock).await
 }
 
-pub async fn list_auth_requests(
-    sock: &mut crate::sock::Sock,
-) -> anyhow::Result<()> {
+/// Return only the existing display-safe device-request metadata.
+pub async fn pending_auth_request_infos(
+) -> anyhow::Result<Vec<rbw::protocol::AuthRequestInfo>> {
     let email = config_email().await?;
     let (access_token, refresh_token) = auth_request_tokens().await?;
     let (new_access_token, requests) =
@@ -829,10 +836,16 @@ pub async fn list_auth_requests(
             .await
             .context("failed to list pending auth requests")?;
     save_refreshed_access_token(new_access_token).await?;
-    let requests = requests
+    requests
         .iter()
         .map(|request| auth_request_info(request, &email))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect()
+}
+
+pub async fn list_auth_requests(
+    sock: &mut crate::sock::Sock,
+) -> anyhow::Result<()> {
+    let requests = pending_auth_request_infos().await?;
     sock.send(&rbw::protocol::Response::AuthRequests { requests })
         .await?;
     Ok(())
@@ -856,12 +869,50 @@ fn encrypt_approval_user_key(
         .context("failed to encrypt user key for auth request")
 }
 
-pub async fn approve_auth_request(
-    sock: &mut crate::sock::Sock,
+struct PreparedAuthRequestApproval {
+    request_id: uuid::Uuid,
+    request: rbw::api::AuthRequest,
+    fingerprint: String,
+    access_token: String,
+    refresh_token: String,
+    cancellation: crate::state::Cancellation,
+}
+
+fn pending_auth_request_info(
+    request: &rbw::api::AuthRequest,
+    request_id: uuid::Uuid,
+    email: &str,
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<rbw::protocol::AuthRequestInfo> {
+    if validate_auth_request_id(&request.id)? != request_id
+        || !matches!(
+            rbw::device_auth::response_state(request),
+            Ok(rbw::device_auth::ResponseState::Pending)
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "auth request is no longer pending or has changed"
+        ));
+    }
+    let info = auth_request_info(request, email)?;
+    if expected_fingerprint
+        .is_some_and(|expected| expected != info.fingerprint)
+    {
+        return Err(anyhow::anyhow!(
+            "auth-request fingerprint has changed; review the request again"
+        ));
+    }
+    Ok(info)
+}
+
+async fn prepare_auth_request_approval(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     request_id: &str,
-    environment: &rbw::protocol::Environment,
-) -> anyhow::Result<()> {
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<(
+    PreparedAuthRequestApproval,
+    rbw::protocol::AuthRequestInfo,
+)> {
     let validated_request_id = validate_auth_request_id(request_id)?;
     let mut cancellation = {
         let state = state.lock().await;
@@ -872,8 +923,9 @@ pub async fn approve_auth_request(
         }
         state.cancellation()
     };
-    let email = config_email().await?;
-    let (access_token, refresh_token) = auth_request_tokens().await?;
+    let email = cancel_or(&mut cancellation, config_email()).await??;
+    let (access_token, refresh_token) =
+        cancel_or(&mut cancellation, auth_request_tokens()).await??;
     let (new_access_token, request) = cancel_or(
         &mut cancellation,
         rbw::actions::get_auth_request(
@@ -883,61 +935,155 @@ pub async fn approve_auth_request(
         ),
     )
     .await??;
-    if !matches!(
-        rbw::device_auth::response_state(&request),
-        Ok(rbw::device_auth::ResponseState::Pending)
-    ) {
-        return Err(anyhow::anyhow!(
-            "auth request has already been answered or has invalid state"
-        ));
-    }
+    ensure_not_cancelled(&cancellation)?;
+    let request_info = pending_auth_request_info(
+        &request,
+        validated_request_id,
+        &email,
+        expected_fingerprint,
+    )?;
     let active_access_token = new_access_token
         .as_deref()
         .unwrap_or(access_token.as_str())
         .to_string();
     save_refreshed_access_token(new_access_token).await?;
     ensure_not_cancelled(&cancellation)?;
-    let request_info = auth_request_info(&request, &email)?;
-    let fingerprint = request_info.fingerprint.clone();
-    sock.send(&rbw::protocol::Response::AuthRequestApproval {
-        request: request_info,
-    })
-    .await?;
+    Ok((
+        PreparedAuthRequestApproval {
+            request_id: validated_request_id,
+            request,
+            fingerprint: request_info.fingerprint.clone(),
+            access_token: active_access_token,
+            refresh_token,
+            cancellation,
+        },
+        request_info,
+    ))
+}
 
-    cancel_or(
-        &mut cancellation,
-        crate::local_auth::authorize(
-            environment,
-            &validated_request_id.to_string(),
-            &fingerprint,
-        ),
-    )
-    .await??;
-    let encrypted_user_key = {
-        let state = state.lock().await;
-        encrypt_approval_user_key(&state, &cancellation, &request.public_key)?
-    };
+/// Complete the single approval path after the caller has explicitly approved.
+/// Preparation/transport failures also close the observable request as failed.
+async fn complete_auth_request_approval(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    request_id: &str,
+    prepared: anyhow::Result<PreparedAuthRequestApproval>,
+) -> anyhow::Result<()> {
+    let result = async {
+        let mut approval = prepared?;
+        let canonical_request_id = approval.request_id.to_string();
+        ensure_not_cancelled(&approval.cancellation)?;
+        cancel_or(
+            &mut approval.cancellation,
+            crate::local_auth::authorize(
+                environment,
+                &canonical_request_id,
+                &approval.fingerprint,
+            ),
+        )
+        .await??;
+        ensure_not_cancelled(&approval.cancellation)?;
 
-    let (new_access_token, _) = cancel_or(
-        &mut cancellation,
-        rbw::actions::update_auth_request(
-            &active_access_token,
-            &refresh_token,
-            request_id,
-            &encrypted_user_key,
-            true,
-        ),
-    )
-    .await?
-    .context("failed to approve auth request")?;
-    ensure_not_cancelled(&cancellation)?;
-    save_refreshed_access_token(new_access_token).await?;
-    ensure_not_cancelled(&cancellation)?;
+        // A request may be answered or replaced while PAM is running. Never
+        // extract key material using a request that is no longer the one reviewed.
+        let (new_access_token, request) = cancel_or(
+            &mut approval.cancellation,
+            rbw::actions::get_auth_request(
+                &approval.access_token,
+                &approval.refresh_token,
+                &canonical_request_id,
+            ),
+        )
+        .await??;
+        ensure_not_cancelled(&approval.cancellation)?;
+        let email = cancel_or(&mut approval.cancellation, config_email())
+            .await??;
+        if request != approval.request {
+            return Err(anyhow::anyhow!(
+                "auth request has changed; review the request again"
+            ));
+        }
+        if auth_request_fingerprint(&request, &email)? != approval.fingerprint {
+            return Err(anyhow::anyhow!(
+                "auth-request fingerprint has changed; review the request again"
+            ));
+        }
+        if let Some(token) = new_access_token.as_ref() {
+            approval.access_token.clone_from(token);
+        }
+        save_refreshed_access_token(new_access_token).await?;
+        ensure_not_cancelled(&approval.cancellation)?;
+        let encrypted_user_key = {
+            let state = state.lock().await;
+            encrypt_approval_user_key(
+                &state,
+                &approval.cancellation,
+                &request.public_key,
+            )?
+        };
+
+        let (new_access_token, _) = cancel_or(
+            &mut approval.cancellation,
+            rbw::actions::update_auth_request(
+                &approval.access_token,
+                &approval.refresh_token,
+                &canonical_request_id,
+                &encrypted_user_key,
+                true,
+            ),
+        )
+        .await?
+        .context("failed to approve auth request")?;
+        ensure_not_cancelled(&approval.cancellation)?;
+        save_refreshed_access_token(new_access_token).await?;
+        ensure_not_cancelled(&approval.cancellation)?;
+        Ok(())
+    }
+    .await;
+    crate::request_ui::device_finished(request_id, result.is_ok());
+    result
+}
+
+pub async fn approve_auth_request(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    request_id: &str,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let prepared = async {
+        let (approval, request) =
+            prepare_auth_request_approval(state.clone(), request_id, None)
+                .await?;
+        crate::request_ui::start(state.clone(), environment).await?;
+        sock.send(&rbw::protocol::Response::AuthRequestApproval { request })
+            .await?;
+        Ok(approval)
+    }
+    .await;
+    complete_auth_request_approval(state, environment, request_id, prepared)
+        .await?;
     respond_ack(sock).await
 }
 
-pub async fn reject_auth_request(
-    sock: &mut crate::sock::Sock,
+/// Called only by the explicit GUI approve callback, never by discovery or GET.
+pub async fn approve_auth_request_from_ui(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    request_id: &str,
+    expected_fingerprint: &str,
+) -> anyhow::Result<()> {
+    let prepared = prepare_auth_request_approval(
+        state.clone(),
+        request_id,
+        Some(expected_fingerprint),
+    )
+    .await
+    .map(|(approval, _)| approval);
+    complete_auth_request_approval(state, environment, request_id, prepared)
+        .await
+}
+
+pub async fn reject_auth_request_from_ui(
     request_id: &str,
 ) -> anyhow::Result<()> {
     validate_auth_request_id(request_id)?;
@@ -952,6 +1098,14 @@ pub async fn reject_auth_request(
     .await
     .context("failed to reject auth request")?;
     save_refreshed_access_token(new_access_token).await?;
+    Ok(())
+}
+
+pub async fn reject_auth_request(
+    sock: &mut crate::sock::Sock,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    reject_auth_request_from_ui(request_id).await?;
     respond_ack(sock).await
 }
 
@@ -1040,6 +1194,14 @@ async fn unlock_state(
     }
 
     Ok(())
+}
+
+/// Unlock through the same native pinentry path used by IPC.
+pub async fn unlock_from_ui(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    unlock_state(state, environment).await
 }
 
 pub async fn unlock(
@@ -1745,6 +1907,67 @@ mod device_auth_tests {
         )
         .is_ok());
         assert!(validate_auth_request_id("../../not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn approval_context_rejects_changed_or_answered_requests() {
+        let request_id = uuid::Uuid::nil();
+        let key = rbw::device_auth::RequestKeyPair::generate().unwrap();
+        let mut request = rbw::api::AuthRequest {
+            id: request_id.to_string(),
+            public_key: key.public_key_base64(),
+            request_device_type: "test device".to_string(),
+            request_device_identifier: None,
+            request_ip_address: "127.0.0.1".to_string(),
+            request_country_name: None,
+            key: None,
+            creation_date: "2026-11-20T00:00:00Z".to_string(),
+            response_date: None,
+            request_approved: None,
+        };
+        let email = "test@example.com";
+        let info =
+            pending_auth_request_info(&request, request_id, email, None)
+                .unwrap();
+        assert!(pending_auth_request_info(
+            &request,
+            request_id,
+            email,
+            Some(&info.fingerprint),
+        )
+        .is_ok());
+        assert!(pending_auth_request_info(
+            &request,
+            request_id,
+            email,
+            Some("alpha-bravo-charlie-delta-echo"),
+        )
+        .is_err());
+        assert!(pending_auth_request_info(
+            &request,
+            uuid::Uuid::from_u128(1),
+            email,
+            Some(&info.fingerprint),
+        )
+        .is_err());
+        request.request_approved = Some(false);
+        request.response_date = Some("2026-11-20T00:01:00Z".to_string());
+        assert!(pending_auth_request_info(
+            &request,
+            request_id,
+            email,
+            Some(&info.fingerprint),
+        )
+        .is_err());
+        request.request_approved = Some(true);
+        request.key = Some("encrypted-key".to_string());
+        assert!(pending_auth_request_info(
+            &request,
+            request_id,
+            email,
+            Some(&info.fingerprint),
+        )
+        .is_err());
     }
 
     #[test]

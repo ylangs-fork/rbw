@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.18.0] - 2026-11-20
+
+### Added
+
+* Portable Linux desktop entry, optional StatusNotifierItem tray icon and
+  actionable native notifications opening the exact local authorization or
+  remote device request in a capability-protected loopback browser dashboard.
+* Explicit remote fingerprint review, approve/reject controls and request
+  history. Device approval still requires native PAM and server acceptance;
+  opening a notification, viewing RGB video or selecting a request never approves.
+* Browser-local RGB positioning during active authorization, with visible camera
+  errors and capture released when leaving the request or page.
+* Commit-pinned Ubuntu amd64 packages containing the existing prebuilt face
+  runtime, desktop assets, checksums and build provenance.
+
+### Changed
+
+* All software prompts, notifications and dashboard text are English.
+* `rbw ui` opens the request dashboard; `rbw ui --background` starts desktop
+  integration without opening a browser. Missing tray support is non-fatal.
+* `rbw-agent --help` and `--version` exit without starting the daemon.
+
+### Fixed
+
+* Keep rejection separate from face authentication so rejecting a remote request
+  never triggers a camera permission prompt.
+* Include the native SVG icon loader in Ubuntu desktop dependencies.
+
 ## [1.17.5] - 2026-11-19
 
 ### Fixed

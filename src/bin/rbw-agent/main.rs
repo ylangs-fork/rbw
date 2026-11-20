@@ -7,6 +7,7 @@ mod debugger;
 mod local_auth;
 mod memory_guard;
 mod notifications;
+mod request_ui;
 mod sock;
 mod ssh_agent;
 mod state;
@@ -23,7 +24,11 @@ async fn tokio_main(
         startup_ack.ack()?;
     }
 
-    let config = rbw::config::Config::load()?;
+    let config = if rbw::dirs::config_file().try_exists()? {
+        rbw::config::Config::load()?
+    } else {
+        rbw::config::Config::new()
+    };
     // Apply enrollment changes without exporting or discarding an unlocked key.
     let session = crate::state::SessionSettings::from_config(&config);
     let sync_timeout_duration =
@@ -59,6 +64,11 @@ async fn tokio_main(
         }));
 
     memory_guard.spawn_watchdogs(state.clone(), sentinel_exit);
+    if config.face_auth == Some(true) || session.pam_gate_required {
+        if request_ui::start(state.clone(), &rbw::protocol::Environment::default()).await.is_err() {
+            log::warn!("rbwBio request panel is unavailable; local authorization will fail closed if observation cannot start");
+        }
+    }
     let agent = crate::agent::Agent::new(
         timer_r,
         sync_timer_r,
@@ -131,6 +141,19 @@ fn real_main() -> anyhow::Result<()> {
 }
 
 fn main() {
+    if std::env::args().len() == 2 {
+        match std::env::args().nth(1).as_deref() {
+            Some("--version" | "-V") => {
+                println!("rbw-agent {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            Some("--help" | "-h") => {
+                println!("rbw-agent {}\nUsage: rbw-agent [--no-daemonize]\n\nBackground vault agent. Use `rbw ui` for the desktop request panel.", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            _ => {}
+        }
+    }
     if crate::memory_guard::sentinel_requested() {
         std::process::exit(i32::from(!crate::memory_guard::run_sentinel()));
     }

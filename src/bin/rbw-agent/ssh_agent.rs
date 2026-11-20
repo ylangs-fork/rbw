@@ -73,7 +73,7 @@ impl SshAgent {
                 let gate = gate
                     .ok_or_else(|| anyhow::anyhow!("PAM gate unavailable"))?
                     .with_context(
-                        environment,
+                        environment.clone(),
                         "Authorize rbw SSH signing",
                         "Look at the camera to authorize an SSH signature",
                     )?;
@@ -84,7 +84,7 @@ impl SshAgent {
                             "agent locked during local authentication"
                         ));
                     }
-                    result = gate.authorize() => result?,
+                    result = crate::request_ui::authorize_local(self.state.clone(), &environment, gate, "SSH signing authorization") => result?,
                 }
                 let mut state = self.state.lock().await;
                 if cancellation.is_cancelled() || !state.l1_alive() {

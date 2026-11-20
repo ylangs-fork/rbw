@@ -585,11 +585,15 @@ mod linux {
             return installed_bundle(&manifest);
         }
         let executable = fs::canonicalize(std::env::current_exe()?)?;
-        let keg = executable
+        let root = executable
             .parent()
             .and_then(Path::parent)
-            .context("cannot locate the installed rbw keg")?;
-        let archive = keg.join("libexec/face-runtime.tar.gz");
+            .context("cannot locate the installed rbw package")?;
+        let archive = if root.join("share/rbwbio/face-runtime.tar.gz").try_exists()? {
+            root.join("share/rbwbio/face-runtime.tar.gz")
+        } else {
+            root.join("libexec/face-runtime.tar.gz")
+        };
         ensure!(fs::symlink_metadata(&archive).is_ok(),
             "the installed rbw package is missing its matching prebuilt face runtime ({}); face authorization remains disabled; no download or source-build fallback is provided",
             archive.display());
