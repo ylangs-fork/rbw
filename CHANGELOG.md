@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+* Distribute rbwBio only through Homebrew, including on Ubuntu Desktop.
+  Remove Debian package tooling and publishing; desktop integration remains
+  included in the Homebrew package.
+
 ## [1.18.0] - 2026-11-20
 
 ### Added
@@ -12,8 +20,6 @@
   opening a notification, viewing RGB video or selecting a request never approves.
 * Browser-local RGB positioning during active authorization, with visible camera
   errors and capture released when leaving the request or page.
-* Commit-pinned Ubuntu amd64 packages containing the existing prebuilt face
-  runtime, desktop assets, checksums and build provenance.
 
 ### Changed
 
@@ -26,7 +32,6 @@
 
 * Keep rejection separate from face authentication so rejecting a remote request
   never triggers a camera permission prompt.
-* Include the native SVG icon loader in Ubuntu desktop dependencies.
 
 ## [1.17.5] - 2026-11-19
 

@@ -1,7 +1,6 @@
 NAME = $(shell cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
 VERSION = $(shell cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
 
-DEB_PACKAGE = $(NAME)_$(VERSION)_amd64.deb
 TGZ_PACKAGE = $(NAME)_$(VERSION)_linux_amd64.tar.gz
 MUSL_TARGET = x86_64-unknown-linux-musl
 GNU_TARGET = x86_64-unknown-linux-gnu
@@ -55,26 +54,17 @@ completion-gnu: release-gnu
 	@./target/$(GNU_TARGET)/release/rbw gen-completions fish > target/$(GNU_TARGET)/release/completion/fish
 .PHONY: completion-gnu
 
-package: pkg/$(DEB_PACKAGE) pkg/$(TGZ_PACKAGE)
+package: pkg/$(TGZ_PACKAGE)
 .PHONY: package
 
 pkg:
 	@mkdir pkg
 
-pkg/$(DEB_PACKAGE): completion-gnu | pkg
-	@cargo deb --no-build --target $(GNU_TARGET) && mv target/$(GNU_TARGET)/debian/$(DEB_PACKAGE) pkg
-
-pkg/$(DEB_PACKAGE).minisig: pkg/$(DEB_PACKAGE)
-	@minisign -Sm $<
-
 pkg/$(TGZ_PACKAGE): release completion | pkg
 	@tar czf $@ -C target/$(MUSL_TARGET)/release rbw rbw-agent completion
 
-release-dir-deb:
-	@ssh partofme mkdir -p releases/rbw/deb
-.PHONY: release-dir-deb
 
-publish: publish-crates-io publish-git-tags publish-deb publish-github
+publish: publish-crates-io publish-git-tags publish-github
 .PHONY: publish
 
 publish-crates-io: test
@@ -88,9 +78,6 @@ publish-git-tags: test
 	@:; git push --tags
 .PHONY: publish-git-tags
 
-publish-deb: test pkg/$(DEB_PACKAGE) pkg/$(DEB_PACKAGE).minisig release-dir-deb
-	@scp pkg/$(DEB_PACKAGE) pkg/$(DEB_PACKAGE).minisig partofme:releases/rbw/deb
-.PHONY: publish-deb
 
 publish-github: test pkg/$(TGZ_PACKAGE)
 	@perl -nle'print if /^## \Q[$(VERSION)]/../^## (?!\Q[$(VERSION)]\E)/' CHANGELOG.md | head -n-2 | gh release create $(VERSION) --verify-tag --notes-file - pkg/$(TGZ_PACKAGE)
