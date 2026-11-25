@@ -163,6 +163,14 @@ pub enum Error {
     #[error("failed to run argon2")]
     Argon2,
 
+    #[error(
+        "pinentry cannot prompt: no usable terminal or graphical display"
+    )]
+    PinentryUnavailable,
+
+    #[error("pinentry timed out")]
+    PinentryTimeout,
+
     #[error("pinentry cancelled")]
     PinentryCancelled,
 

@@ -83,6 +83,10 @@ configuration options:
 * `pinentry`: The
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
+  A prompt needs a usable terminal or a graphical display. Stale terminal paths
+  are not passed to pinentry; headless prompts fail before starting a child.
+  Each prompt has a 120-second total deadline, including process exit; failed
+  children are killed and reaped. On Linux they also die with their agent.
 * `unlock_helper`: Optional shell-style command invoked during `rbw unlock`
   before pinentry is consulted. The command is split with
   [`shlex`](https://docs.rs/shlex/), executed with an empty environment, no

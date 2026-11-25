@@ -188,3 +188,23 @@ credentials.
   not claimed.
 - These automated fixtures do not establish physical camera or human biometric
   assurance. Their test PAM module is never packaged or installed on a user host.
+
+
+## Interactive live requester
+
+For a deliberate real-hardware acceptance run on Linux (Python 3.9+), use a
+real tmux terminal and a designated existing test login UUID:
+
+```sh
+rbw config set l1_timeout 600
+python3 tests/device-approval/live_request.py --item-id <test-login-UUID>
+```
+
+Confirm beforehand that approval will happen in rbwBio, not another native
+client. The requester may still require its normal authenticator code. Enter
+that only in the native terminal prompt, never in chat or logs. The helper
+refuses a missing terminal before sending a request and discards the retrieved
+secret directly to `/dev/null`. It checks pinentry processes on every exit and
+cleans only same-user processes started by this run on this exact terminal.
+Do not wrap this interactive helper in `pi-notify run`, which discards stdin;
+arm a completion notification around a separate terminal-completion event.
