@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [1.18.1] - 2026-11-25
+
+### Fixed
+
+* Reject unusable terminal prompts before starting pinentry. Bound each prompt
+  and process exit to 120 seconds, and kill and reap failed helpers. Linux
+  helpers are also killed if their agent dies, preventing runaway orphaned
+  pinentry processes after terminal loss or agent termination.
+* Keep live device-approval acceptance interactive and clean up only its own
+  pinentry prompts, without recording retrieved secrets.
+
 ### Changed
 
 * Distribute rbwBio only through Homebrew, including on Ubuntu Desktop.
